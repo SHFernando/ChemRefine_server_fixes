@@ -122,3 +122,7 @@ __pycache__/
 tests
 src/chemrefine/debug.txt
 src/chemrefine/input.generated.yaml
+src/chemrefine/debug.txt
+src/chemrefine/input.generated.yaml
+
+/tests
