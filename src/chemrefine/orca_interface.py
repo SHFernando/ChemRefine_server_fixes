@@ -312,26 +312,29 @@ class OrcaJobSubmitter:
                 f.write("kill $SERVER_PID\n\n")
             
             elif engine.lower() == "pyscf":
-                # Validate required PySCF settings
                 if not basis:
                     raise ValueError("engine='pyscf' requires basis (e.g., def2-svp).")
                 if not functional:
                     raise ValueError("engine='pyscf' requires functional/xc (e.g., pbe).")
+
                 if gpu is None:
                     gpu = (device == "cuda")
 
-                f.write("# Start PySCF server before ORCA (external optimizer backend)\n")
+                f.write("# Start PySCF server before ORCA (external backend)\n")
 
-                # Example: start your existing server with the proper flags
-                # Adjust module/path if your server entrypoint differs
-                df_flag = "--df" if df else ""
-                gpu_flag = "--gpu" if gpu else ""
+                df_flag = "--default-df" if df else ""
+                gpu_flag = "--default-gpu" if gpu else ""
 
                 f.write(
-                    f"python -m chemrefine.pyscf_server "
-                    f"--method {pyscf_method} --xc {functional} --basis {basis} "
-                    f"{df_flag} {gpu_flag} --device {device} --bind {bind} "
-                    f"> $OUTPUT_DIR/pyscf_server.log 2>&1 &\n"
+                    "python -m chemrefine.pyscf_server "
+                    f"--bind {bind} "
+                    f"--default-method {pyscf_method} "
+                    f"--default-xc {functional} "
+                    f"--default-basis {basis} "
+                    f"{df_flag} {gpu_flag} "
+                    "--nthreads 1 "
+                    f"--log-file $OUTPUT_DIR/pyscf_server.log "
+                    "> $OUTPUT_DIR/pyscf_server.stdout 2>&1 &\n"
                 )
                 f.write("SERVER_PID=$!\n")
                 f.write("trap 'kill $SERVER_PID 2>/dev/null' EXIT\n")
@@ -343,6 +346,7 @@ class OrcaJobSubmitter:
                     "|| { echo 'Error: ORCA execution failed.'; kill $SERVER_PID; exit 1; }\n"
                 )
                 f.write("kill $SERVER_PID\n\n")
+
 
             else:
                 f.write("export OMP_NUM_THREADS=1\n")
