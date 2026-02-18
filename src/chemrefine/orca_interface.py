@@ -328,7 +328,7 @@ class OrcaJobSubmitter:
                 gpu_flag = "--gpu" if gpu else ""
 
                 f.write(
-                    f"python -m chemrefine.server "
+                    f"python -m chemrefine.pyscf_server "
                     f"--method {pyscf_method} --xc {functional} --basis {basis} "
                     f"{df_flag} {gpu_flag} --device {device} --bind {bind} "
                     f"> $OUTPUT_DIR/pyscf_server.log 2>&1 &\n"
