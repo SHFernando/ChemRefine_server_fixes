@@ -312,33 +312,21 @@ class OrcaJobSubmitter:
                 f.write("kill $SERVER_PID\n\n")
             
             elif engine.lower() == "pyscf":
-                if not basis:
-                    raise ValueError("engine='pyscf' requires basis (e.g., def2-svp).")
-                if not functional:
-                    raise ValueError("engine='pyscf' requires functional/xc (e.g., pbe).")
-
-                if gpu is None:
-                    gpu = (device == "cuda")
-
                 f.write("# Start PySCF server before ORCA (external backend)\n")
 
-                df_flag = "--default-df" if df else ""
-                gpu_flag = "--default-gpu" if gpu else ""
+                # Choose python executable (optional). If not set, rely on env/modules.
+                
 
+                # Start server in background
                 f.write(
-                    "python -m chemrefine.pyscf_server "
-                    f"--bind {bind} "
-                    f"--default-method {pyscf_method} "
-                    f"--default-xc {functional} "
-                    f"--default-basis {basis} "
-                    f"{df_flag} {gpu_flag} "
-                    "--nthreads 1 "
+                    f"{py} -m chemrefine.pyscf_server "
+                    f"--bind {bind} --nthreads 4 "
                     f"--log-file $OUTPUT_DIR/pyscf_server.log "
-                    "> $OUTPUT_DIR/pyscf_server.stdout 2>&1 &\n"
+                    f"> $OUTPUT_DIR/pyscf_server.stdout 2>&1 &\n"
                 )
                 f.write("SERVER_PID=$!\n")
                 f.write("trap 'kill $SERVER_PID 2>/dev/null' EXIT\n")
-                f.write("sleep 10\n")
+                f.write("sleep 5\n")  # usually enough if it starts fast
 
                 f.write("export OMP_NUM_THREADS=1\n")
                 f.write(
@@ -346,6 +334,7 @@ class OrcaJobSubmitter:
                     "|| { echo 'Error: ORCA execution failed.'; kill $SERVER_PID; exit 1; }\n"
                 )
                 f.write("kill $SERVER_PID\n\n")
+
 
 
             else:
