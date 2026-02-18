@@ -1,19 +1,32 @@
 from __future__ import annotations
 
 import os
-import yaml
+import sys
+import glob
+import shutil
 import logging
+from typing import Any, Optional
+
+import yaml
+
 from .parse import ArgumentParser
 from .refine import StructureRefiner
 from .utils import Utility
-from dataclasses import dataclass
-from typing import Any, Optional
+
 from .orca_interface import OrcaInterface, OrcaJobSubmitter
-import shutil
-import sys
-import glob
 from .mlff import MLFFTrainer
-from chemrefine.utils import (
+
+# Types (NEW)
+from .types import (
+    EngineConfig,
+    SamplingConfig,
+    StepContext,
+    StepResult,
+    PipelineState,
+)
+
+# Utility functions (make these relative, not chemrefine.utils)
+from .utils import (
     update_step_manifest_outputs,
     map_outputs_to_ids,
     write_step_manifest,
@@ -21,7 +34,9 @@ from chemrefine.utils import (
     resolve_persistent_ids,
     smiles_to_xyz,
 )
-from chemrefine.cache_utils import (
+
+# Cache utilities (relative import)
+from .cache_utils import (
     CACHE_VERSION,
     StepCache,
     save_step_cache,
@@ -29,51 +44,6 @@ from chemrefine.cache_utils import (
     build_step_fingerprint,
 )
 
-
-@dataclass
-class MLConfig:
-    model: str
-    task: str
-    bind_address: str
-    device: str
-
-@dataclass
-class SamplingConfig:
-    method: Optional[str]
-    parameters: dict[str, Any]
-
-@dataclass
-class StepContext:
-    step_number: int
-    operation: str
-    engine: str
-    charge: int
-    multiplicity: int
-    ml: Optional[MLConfig]
-    sampling: SamplingConfig
-    step: dict[str, Any]          # original step dict
-
-@dataclass
-class PipelineState:
-    last_coords: Any = None
-    last_ids: Any = None
-    last_energies: Any = None
-    last_forces: Any = None
-
-@dataclass
-class StepIO:
-    step_dir: str
-    input_files: list[str]
-    output_files: list[str]
-    seeds_ids: Optional[list[str]] = None
-
-@dataclass
-class StepResult:
-    coords: Any
-    ids: Any
-    energies: Any
-    forces: Any
-    output_files: list[str]
 
 class ChemRefiner:
     """
@@ -332,40 +302,48 @@ class ChemRefiner:
         return filtered_coordinates, selected_ids
 
     def submit_orca_jobs(
-        self,
-        input_files,
-        max_cores,
-        step_dir,
-        device="cpu",
-        operation="OPT+SP",
-        engine="DFT",
-        model_name=None,
-        task_name=None,
-    ):
+    self,
+    *,
+    input_files,
+    max_cores,
+    step_dir,
+    operation="OPT+SP",
+    engine="dft",
+    engine_cfg=None,  # EngineConfig
+):
         """
-        Submits ORCA jobs for each input file in the step directory using the OrcaJobSubmitter.
+        Submits ORCA jobs for each input file in the step directory using OrcaJobSubmitter.
+        """
+        engine = (engine or "dft").lower()
 
-        Args:
-            input_files (list): List of ORCA input files.
-            cores (int): Maximum total cores allowed for all jobs.
-            step_dir (str): Path to the step directory.
-        """
+        # derive settings from engine_cfg (backward compatible defaults)
+        device = getattr(engine_cfg, "device", None) or "cpu"
+        model_name = getattr(engine_cfg, "model_name", None)
+        task_name = getattr(engine_cfg, "task_name", None)
+        bind = getattr(engine_cfg, "bind", None)
+        basis = getattr(engine_cfg, "basis", None)
+        functional = getattr(engine_cfg, "functional", None)
+        extras = getattr(engine_cfg, "extras", None) or {}
+
         logging.info(f"Switching to working directory: {step_dir}")
         original_dir = os.getcwd()
         os.chdir(step_dir)
         logging.info(f"Current working directory: {os.getcwd()}")
-        logging.info(
-            f"Running in {self.scratch_dir} from submit_orca_jobs helper function."
-        )
+        logging.info(f"Running in {self.scratch_dir} from submit_orca_jobs helper function.")
+
         try:
             logging.info(
-                f"Submitting ORCA jobs in {step_dir} with {len(input_files)} input files using {device}."
+                f"Submitting ORCA jobs in {step_dir} with {len(input_files)} input files "
+                f"using device={device}, engine={engine}, operation={operation}."
             )
+
             self.orca_submitter = OrcaJobSubmitter(
                 scratch_dir=self.scratch_dir,
                 orca_executable=self.orca_executable,
                 device=device,
             )
+
+            # Preferred: pass engine_cfg through so OrcaJobSubmitter can decide what it needs
             self.orca_submitter.submit_files(
                 input_files=input_files,
                 max_cores=max_cores,
@@ -375,7 +353,14 @@ class ChemRefiner:
                 operation=operation,
                 model_name=model_name,
                 task_name=task_name,
+
+                # NEW: pyscf/server-client support
+                bind=bind,
+                basis=basis,
+                functional=functional,
+                engine_extras=extras,
             )
+
         except Exception as e:
             logging.error(f"Error while submitting ORCA jobs in {step_dir}: {str(e)}")
             raise
@@ -1178,7 +1163,7 @@ class ChemRefiner:
         operation = step["operation"].upper()
         engine = step.get("engine", "dft").lower()
 
-        ml = self._extract_ml_config(step, engine)
+        engine_cfg = self._extract_engine_config(step, engine)
         sampling = self._extract_sampling(step)
 
         charge = step.get("charge", self.charge)
@@ -1190,10 +1175,11 @@ class ChemRefiner:
             engine=engine,
             charge=charge,
             multiplicity=multiplicity,
-            ml=ml,
+            engine_cfg=engine_cfg,
             sampling=sampling,
             step=step,
         )
+
 
     def _validate_step_context(self, ctx: StepContext) -> None:
         valid_operations = {
@@ -1211,19 +1197,60 @@ class ChemRefiner:
                 f"Invalid engine '{ctx.engine}' at step {ctx.step_number}. "
                 f"Must be one of {valid_engines}."
             )
+        if ctx.engine == "pyscf":
+            if not ctx.engine_cfg.basis:
+                raise ValueError(f"[step {ctx.step_number}] pyscf engine requires 'pyscf: basis'.")
+            if not ctx.engine_cfg.functional:
+                raise ValueError(f"[step {ctx.step_number}] pyscf engine requires 'pyscf: functional' (or 'xc').")
+            if ctx.engine_cfg.device not in {"cpu", "cuda"}:
+                raise ValueError(f"[step {ctx.step_number}] pyscf device must be 'cpu' or 'cuda'.")
+            ###____RUN____###
 
-        ###____RUN____###
+    def _extract_engine_config(self, step: dict, engine: str) -> EngineConfig:
+        engine = engine.lower()
 
-    def _extract_ml_config(self, step: dict, engine: str) -> Optional[MLConfig]:
-        if engine not in {"mlff", "mlip"}:
-            return None
-        ml_config = step.get(engine, {})
-        return MLConfig(
-            model=ml_config.get("model_name", "medium"),
-            task=ml_config.get("task_name", "mace_off"),
-            bind_address=ml_config.get("bind", "127.0.0.1:8888"),
-            device=ml_config.get("device", "cuda"),
-        )
+        # --- defaults shared across engines ---
+        default_bind = "127.0.0.1:8888"
+
+        # ----------------
+        # MLFF / MLIP
+        # ----------------
+        if engine in {"mlff", "mlip"}:
+            cfg = step.get(engine, {}) or {}
+            return EngineConfig(
+                engine=engine,
+                model_name=cfg.get("model_name", "medium"),
+                task_name=cfg.get("task_name", "mace_off"),
+                bind=cfg.get("bind", default_bind),
+                device=cfg.get("device", "cuda"),
+                extras=dict(cfg),
+            )
+
+        # ----------------
+        # PySCF (ORCA optimizer + PySCF backend)
+        # ----------------
+        if engine == "pyscf":
+            cfg = step.get("pyscf", {}) or {}
+
+            # allow either gpu: true/false or device: cuda/cpu
+            device = cfg.get("device")
+            if device is None:
+                device = "cuda" if cfg.get("gpu", False) else "cpu"
+
+            return EngineConfig(
+                engine="pyscf",
+                device=device,
+                bind=cfg.get("bind", default_bind),
+                basis=cfg.get("basis", step.get("basis")),               # allow top-level fallback if you want
+                functional=cfg.get("functional", cfg.get("xc", "pbe")),   # support xc alias; default pbe
+                extras=dict(cfg),
+            )
+
+        # ----------------
+        # Plain DFT (ORCA)
+        # ----------------
+        return EngineConfig(engine=engine, bind=default_bind, device="cpu")
+    
 
     def _extract_sampling(self, step: dict) -> SamplingConfig:
         st = step.get("sample_type")
@@ -1253,7 +1280,13 @@ class ChemRefiner:
             output_files=[],  # not stored in your StepCache (unless you add it)
         )
 
-    def _execute_step_heavy_work(self, ctx: StepContext, state: PipelineState, step_dir: str, fp_now: str) -> StepResult:
+    def _execute_step_heavy_work(
+    self,
+    ctx: StepContext,
+    state: PipelineState,
+    step_dir: str,
+    fp_now: str,
+) -> StepResult:
         io = self._prepare_step_io(ctx, state)
         write_step_manifest(ctx.step_number, io.step_dir, io.input_files, ctx.operation, ctx.engine)
 
@@ -1263,10 +1296,9 @@ class ChemRefiner:
             step_dir=io.step_dir,
             operation=ctx.operation,
             engine=ctx.engine,
-            model_name=(ctx.ml.model if ctx.ml else None),
-            task_name=(ctx.ml.task if ctx.ml else None),
-            device=(ctx.ml.device if ctx.ml else None),
+            engine_cfg=ctx.engine_cfg,   
         )
+
 
         coords, energies, forces = self.orca.parse_output(io.output_files, ctx.operation, dir=io.step_dir)
         update_step_manifest_outputs(io.step_dir, ctx.step_number, io.output_files)
