@@ -172,20 +172,27 @@ class OrcaJobSubmitter:
         return 1
 
     def generate_slurm_script(
-        self,
-        input_file: Path,
-        pal_value: int,
-        template_dir: str,
-        output_dir: str = ".",
-        job_name: str = None,
-        device: str = "cpu",
-        operation: str = "OPT+SP",
-        engine: str = "DFT",
-        model_name: str = "uma-s-1",
-        task_name: str = "omol",
-        bind: str = "127.0.0.1:8888",
-        model_path: str = None,
-    ):
+    self,
+    input_file: Path,
+    pal_value: int,
+    template_dir: str,
+    output_dir: str = ".",
+    job_name: str = None,
+    device: str = "cpu",
+    operation: str = "OPT+SP",
+    engine: str = "DFT",
+    model_name: str = "uma-s-1",
+    task_name: str = "omol",
+    bind: str = "127.0.0.1:8888",
+    model_path: str = None,
+    # --- NEW: PySCF knobs ---
+    basis: str | None = None,
+    functional: str | None = None,   # or xc
+    df: bool = False,
+    gpu: bool | None = None,
+    pyscf_method: str = "dft",
+):
+
         """
         Generate a SLURM script by combining a user-provided header with a consistent footer.
 
@@ -284,7 +291,7 @@ class OrcaJobSubmitter:
             f.write(
                 "cd $SCRATCH_DIR || { echo 'Error: Failed to change directory'; exit 1; }\n\n"
             )
-
+            
             if engine.lower() == "mlff":
                 f.write("# Start MLFF socket server before ORCA\n")
                 if model_path:
@@ -303,6 +310,40 @@ class OrcaJobSubmitter:
                     f"$ORCA_EXEC {input_file.name} > $OUTPUT_DIR/{job_name}.out || {{ echo 'Error: ORCA execution failed.'; kill $SERVER_PID; exit 1; }}\n"
                 )
                 f.write("kill $SERVER_PID\n\n")
+            
+            elif engine.lower() == "pyscf":
+                # Validate required PySCF settings
+                if not basis:
+                    raise ValueError("engine='pyscf' requires basis (e.g., def2-svp).")
+                if not functional:
+                    raise ValueError("engine='pyscf' requires functional/xc (e.g., pbe).")
+                if gpu is None:
+                    gpu = (device == "cuda")
+
+                f.write("# Start PySCF server before ORCA (external optimizer backend)\n")
+
+                # Example: start your existing server with the proper flags
+                # Adjust module/path if your server entrypoint differs
+                df_flag = "--df" if df else ""
+                gpu_flag = "--gpu" if gpu else ""
+
+                f.write(
+                    f"python -m chemrefine.server "
+                    f"--method {pyscf_method} --xc {functional} --basis {basis} "
+                    f"{df_flag} {gpu_flag} --device {device} --bind {bind} "
+                    f"> $OUTPUT_DIR/pyscf_server.log 2>&1 &\n"
+                )
+                f.write("SERVER_PID=$!\n")
+                f.write("trap 'kill $SERVER_PID 2>/dev/null' EXIT\n")
+                f.write("sleep 10\n")
+
+                f.write("export OMP_NUM_THREADS=1\n")
+                f.write(
+                    f"$ORCA_EXEC {input_file.name} > $OUTPUT_DIR/{job_name}.out "
+                    "|| { echo 'Error: ORCA execution failed.'; kill $SERVER_PID; exit 1; }\n"
+                )
+                f.write("kill $SERVER_PID\n\n")
+
             else:
                 f.write("export OMP_NUM_THREADS=1\n")
                 f.write(
