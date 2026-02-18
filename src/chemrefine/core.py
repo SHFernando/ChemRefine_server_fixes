@@ -94,18 +94,21 @@ class ChemRefiner:
         self.next_id = 1  # 0 will be the initial seed; next fresh ID starts at 1
 
     def prepare_step1_directory(
-        self,
-        step_number,
-        initial_xyz=None,
-        charge=None,
-        multiplicity=None,
-        operation="OPT+SP",
-        engine="dft",
-        model_name=None,
-        task_name=None,
-        device="cpu",
-        bind="127.0.0.1:8888",
-    ):
+    self,
+    step_number,
+    initial_xyz=None,
+    charge=None,
+    multiplicity=None,
+    operation="OPT+SP",
+    engine="dft",
+    model_name=None,
+    task_name=None,
+    device="cpu",
+    bind="127.0.0.1:8888",
+    basis=None,
+    functional=None,       # or pass xc via engine_extras
+    engine_extras=None,    # dict, e.g. pyscf: {df: true, gpu: true, method: dft, prog: ...}
+):
         """
         Prepare the directory for the first step by copying one or more initial XYZ files,
         or generating XYZ files from a CSV of SMILES strings. Produces input/output files
@@ -119,31 +122,26 @@ class ChemRefiner:
         step_dir = os.path.join(self.output_dir, f"step{step_number}")
         os.makedirs(step_dir, exist_ok=True)
 
+        eng = (engine or "dft").lower()
+        extras = engine_extras or {}
+
         # --- Discover/generate initial xyz files ---
         if initial_xyz is None:
-            # Default: look for "step1.xyz" in template_dir
             src_xyz_files = [os.path.join(self.template_dir, "step1.xyz")]
 
         elif os.path.isdir(initial_xyz):
-            # User provided a directory → take all *.xyz inside
             src_xyz_files = sorted(
-                f
-                for f in glob.glob(os.path.join(initial_xyz, "*.xyz"))
-                if os.path.isfile(f)
+                f for f in glob.glob(os.path.join(initial_xyz, "*.xyz")) if os.path.isfile(f)
             )
             if not src_xyz_files:
-                raise FileNotFoundError(
-                    f"No .xyz files found in directory '{initial_xyz}'."
-                )
+                raise FileNotFoundError(f"No .xyz files found in directory '{initial_xyz}'.")
 
         elif initial_xyz.endswith(".csv"):
-            # User provided a CSV with SMILES strings → convert them into XYZs
             src_xyz_files = smiles_to_xyz(initial_xyz, step_dir)
             if not src_xyz_files:
                 raise ValueError(f"No SMILES could be converted from '{initial_xyz}'.")
 
         else:
-            # User provided a single XYZ file
             src_xyz_files = [initial_xyz]
 
         # --- Copy/normalize names into step_dir ---
@@ -152,7 +150,7 @@ class ChemRefiner:
             if not os.path.exists(src):
                 raise FileNotFoundError(f"Initial XYZ file '{src}' not found.")
             dst = os.path.join(step_dir, f"step{step_number}_structure_{idx}.xyz")
-            if src != dst:  # avoid redundant copy
+            if src != dst:
                 shutil.copyfile(src, dst)
             xyz_filenames.append(dst)
 
@@ -164,6 +162,7 @@ class ChemRefiner:
             )
 
         # --- Generate inputs/outputs ---
+        # Pass through pyscf knobs only when relevant (create_input can also ignore extras safely)
         input_files, output_files = self.orca.create_input(
             xyz_filenames,
             template_inp,
@@ -171,17 +170,26 @@ class ChemRefiner:
             multiplicity,
             output_dir=step_dir,
             operation=operation,
-            engine=engine,
+            engine=eng,
             model_name=model_name,
             task_name=task_name,
             device=device,
             bind=bind,
+
+            # NEW: PySCF external method support
+            basis=basis,
+            xc=(functional or extras.get("xc") or extras.get("functional")),
+            df=bool(extras.get("df", False)),
+            gpu=extras.get("gpu", None),                 # None => infer from device in create_input
+            pyscf_method=extras.get("method", "dft"),
+            pyscf_prog=extras.get("prog", None),
         )
 
         # --- Assign seed IDs (one per input structure) ---
         seed_ids = list(range(len(input_files)))
 
         return step_dir, input_files, output_files, seed_ids
+
 
     def prepare_subsequent_step_directory(
         self,
