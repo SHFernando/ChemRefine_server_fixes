@@ -319,7 +319,7 @@ class OrcaJobSubmitter:
 
                 # Start server in background
                 f.write(
-                    f"{py} -m chemrefine.pyscf_server "
+                    f"python -m chemrefine.pyscf_server "
                     f"--bind {bind} --nthreads 4 "
                     f"--log-file $OUTPUT_DIR/pyscf_server.log "
                     f"> $OUTPUT_DIR/pyscf_server.stdout 2>&1 &\n"
