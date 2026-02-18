@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 import time
 import numpy as np
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 # chemrefine/orca_interface.py
 
@@ -42,6 +42,8 @@ class OrcaJobSubmitter:
         bind: str = "127.0.0.1:8888",
         scratch_dir: str = None,
         save_scratch: bool = False,
+        basis: Optional[str] = None,
+        functional: Optional[str] = None,
     ):
         """
         Initialize the ORCA job submitter.
@@ -57,7 +59,9 @@ class OrcaJobSubmitter:
         self.utility = Utility()
         self.device = device
         self.bind = bind
-
+        self.basis = basis
+        self.functional = functional
+        
     def submit_files(
         self,
         input_files,
@@ -66,7 +70,7 @@ class OrcaJobSubmitter:
         output_dir=".",
         device=None,
         operation="OPT+SP",
-        engine="DFT",
+        engine="dft",
         model_name=None,
         task_name=None,
         model_path=None,
@@ -117,6 +121,8 @@ class OrcaJobSubmitter:
                 engine=engine,
                 bind=self.bind,
                 model_path=model_path,
+                basis=self.basis,
+                functional=self.functional,
             )
 
             job_id = self.utility.submit_job(slurm_script)
@@ -323,41 +329,46 @@ class OrcaInterface:
         self.job_submitter = OrcaJobSubmitter()
 
     def create_input(
-        self,
-        xyz_files,
-        template,
-        charge,
-        multiplicity,
-        output_dir="./",
-        operation="OPT+SP",
-        engine="DFT",
-        model_name=None,
-        task_name=None,
-        device="cuda",
-        bind="127.0.0.1:8888",
-    ):
+    self,
+    xyz_files,
+    template,
+    charge,
+    multiplicity,
+    output_dir="./",
+    operation="OPT+SP",
+    engine="dft",
+    model_name=None,
+    task_name=None,
+    device="cuda",
+    bind="127.0.0.1:8888",
+    # --- NEW: PySCF knobs ---
+    pyscf_prog: str | None = None,   # path to pyscf.sh (defaults to chemrefine/pyscf.sh)
+    pyscf_method: str = "dft",       # what your server expects; keep "dft" if that's your API
+    xc: str | None = None,           # e.g., "pbe"
+    basis: str | None = None,        # e.g., "def2-svp"
+    df: bool = False,                # adds --df
+    gpu: bool | None = None,         # adds --gpu; if None, infer from device=="cuda"
+):
         """
-        Generate ORCA .inp files from xyz inputs, adding MLFF external method if specified.
+        Generate ORCA .inp files from xyz inputs, adding external method blocks if specified.
 
-        Args:
-            xyz_files (list): List of xyz file paths.
-            template (str): ORCA input template path.
-            charge (int): Molecular charge.
-            multiplicity (int): Spin multiplicity.
-            output_dir (str): Destination directory.
-            operation (str): Operation type (e.g., 'GOAT', 'OPT+SP').
-            engine (str): Computational engine ('dft' or 'mlff').
-            model_name (str): MLFF model name (if using MLFF).
-            task_name (str): MLFF task name (if using MLFF).
-            device (str): Device for MLFF ('cuda' or 'cpu').
-            bind (str): Server bind address for MLFF.
-
-        Returns:
-            tuple: Lists of input and output file paths.
+        Supported engines:
+        - dft: standard ORCA input
+        - mlff: ORCA external method (uma.sh)
+        - pyscf: ORCA external method (pyscf.sh) for energies/gradients while ORCA drives OPT
         """
+        import re
+        import os
+        import logging
+
         input_files, output_files = [], []
-        logging.debug(f"output_dir IN create_input: {output_dir}")
         os.makedirs(output_dir, exist_ok=True)
+
+        eng = (engine or "dft").lower()
+
+        # infer gpu flag if not explicitly provided
+        if gpu is None:
+            gpu = (device or "").lower() == "cuda"
 
         for xyz in xyz_files:
             base = os.path.splitext(os.path.basename(xyz))[0]
@@ -372,17 +383,58 @@ class OrcaInterface:
             # Remove any old xyzfile lines and clean formatting
             content = re.sub(r"^\s*\*\s+xyzfile.*$", "", content, flags=re.MULTILINE)
             content = content.rstrip() + "\n\n"
-            if engine and engine.lower() == "mlff":
-                # Add MLFF method block if specified
-                run_mlff_path = os.path.abspath(
-                    os.path.join(os.path.dirname(__file__), "uma.sh")
-                )
-                ext_params = f"--bind {bind}"
+
+            # -------------------------
+            # External engines
+            # -------------------------
+            if eng == "mlff":
+                run_mlff_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "uma.sh"))
+
+                # include bind (+ optionally device/model/task if your uma.sh supports them)
+                ext_parts = [f"--bind {bind}"]
+                # ext_parts.append(f"--device {device}")     # uncomment if supported
+                # if model_name: ext_parts.append(f"--model {model_name}")
+                # if task_name:  ext_parts.append(f"--task {task_name}")
+
+                ext_params = " ".join(ext_parts)
+
                 content += "%method\n"
                 content += f'  ProgExt "{run_mlff_path}"\n'
                 content += f'  Ext_Params "{ext_params}"\n'
                 content += "end\n\n"
 
+            elif eng == "pyscf":
+                # default path if not provided
+                if pyscf_prog is None:
+                    pyscf_prog = os.path.abspath(os.path.join(os.path.dirname(__file__), "pyscf.sh"))
+
+                # require xc and basis for pyscf
+                if not xc:
+                    raise ValueError("engine='pyscf' requires xc (e.g., 'pbe').")
+                if not basis:
+                    raise ValueError("engine='pyscf' requires basis (e.g., 'def2-svp').")
+
+                ext_parts = [
+                    f"--bind {bind}",
+                    f"--method {pyscf_method}",
+                    f"--xc {xc}",
+                    f"--basis {basis}",
+                ]
+                if df:
+                    ext_parts.append("--df")
+                if gpu:
+                    ext_parts.append("--gpu")
+
+                ext_params = " ".join(ext_parts)
+
+                content += "%method\n"
+                content += f'  ProgExt "{pyscf_prog}"\n'
+                content += f'  Ext_Params "{ext_params}"\n'
+                content += "end\n\n"
+
+            # -------------------------
+            # XYZ file line
+            # -------------------------
             content += f'%base "{base}_opt" \n'
             content += f"* xyzfile {charge} {multiplicity} {xyz}\n\n"
 
@@ -390,6 +442,7 @@ class OrcaInterface:
                 f.write(content)
 
         return input_files, output_files
+
 
     def parse_output(self, file_paths, operation, dir: str = "./"):
         """

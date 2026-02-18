@@ -23,6 +23,7 @@ from .types import (
     StepContext,
     StepResult,
     PipelineState,
+    StepIO,
 )
 
 # Utility functions (make these relative, not chemrefine.utils)
@@ -320,10 +321,10 @@ class ChemRefiner:
         device = getattr(engine_cfg, "device", None) or "cpu"
         model_name = getattr(engine_cfg, "model_name", None)
         task_name = getattr(engine_cfg, "task_name", None)
-        bind = getattr(engine_cfg, "bind", None)
+        bind = getattr(engine_cfg, "bind", None) or "127.0.0.1:8888"
         basis = getattr(engine_cfg, "basis", None)
         functional = getattr(engine_cfg, "functional", None)
-        extras = getattr(engine_cfg, "extras", None) or {}
+        model_path = getattr(engine_cfg, "model_path", None)  # if you add it later
 
         logging.info(f"Switching to working directory: {step_dir}")
         original_dir = os.getcwd()
@@ -337,13 +338,17 @@ class ChemRefiner:
                 f"using device={device}, engine={engine}, operation={operation}."
             )
 
+            # Create submitter with ALL engine-specific knobs stored on the instance
             self.orca_submitter = OrcaJobSubmitter(
                 scratch_dir=self.scratch_dir,
                 orca_executable=self.orca_executable,
                 device=device,
+                bind=bind,
+                basis=basis,
+                functional=functional,
             )
 
-            # Preferred: pass engine_cfg through so OrcaJobSubmitter can decide what it needs
+            # Keep submit_files signature minimal; it uses self.device/self.bind/...
             self.orca_submitter.submit_files(
                 input_files=input_files,
                 max_cores=max_cores,
@@ -353,12 +358,7 @@ class ChemRefiner:
                 operation=operation,
                 model_name=model_name,
                 task_name=task_name,
-
-                # NEW: pyscf/server-client support
-                bind=bind,
-                basis=basis,
-                functional=functional,
-                engine_extras=extras,
+                model_path=model_path,
             )
 
         except Exception as e:
@@ -1250,7 +1250,6 @@ class ChemRefiner:
         # Plain DFT (ORCA)
         # ----------------
         return EngineConfig(engine=engine, bind=default_bind, device="cpu")
-    
 
     def _extract_sampling(self, step: dict) -> SamplingConfig:
         st = step.get("sample_type")
@@ -1322,8 +1321,11 @@ class ChemRefiner:
         return StepResult(coords=coords, ids=ids, energies=energies, forces=forces, output_files=io.output_files)
 
     def _prepare_step_io(self, ctx: StepContext, state: PipelineState) -> StepIO:
+        cfg = ctx.engine_cfg  # EngineConfig
+
         if ctx.step_number == 1:
             initial_xyz = self.config.get("initial_xyz", None)
+
             step_dir, input_files, output_files, seeds_ids = self.prepare_step1_directory(
                 step_number=ctx.step_number,
                 initial_xyz=initial_xyz,
@@ -1331,15 +1333,29 @@ class ChemRefiner:
                 multiplicity=ctx.multiplicity,
                 operation=ctx.operation,
                 engine=ctx.engine,
-                model_name=(ctx.ml.model if ctx.ml else None),
-                task_name=(ctx.ml.task if ctx.ml else None),
-                device=(ctx.ml.device if ctx.ml else None),
-                bind=(ctx.ml.bind_address if ctx.ml else None),
+
+                # unified engine config threading
+                model_name=cfg.model_name,
+                task_name=cfg.task_name,
+                device=cfg.device,
+                bind=cfg.bind,
+
+                # pyscf-specific (safe for others; they can ignore)
+                basis=cfg.basis,
+                functional=cfg.functional,
+                engine_extras=cfg.extras,
             )
+
             state.last_ids = seeds_ids
-            return StepIO(step_dir=step_dir, input_files=input_files, output_files=output_files, seeds_ids=seeds_ids)
+            return StepIO(
+                step_dir=step_dir,
+                input_files=input_files,
+                output_files=output_files,
+                seeds_ids=seeds_ids,
+            )
 
         validate_structure_ids_or_raise(state.last_ids, ctx.step_number)
+
         step_dir, input_files, output_files = self.prepare_subsequent_step_directory(
             step_number=ctx.step_number,
             filtered_coordinates=state.last_coords,
@@ -1348,12 +1364,21 @@ class ChemRefiner:
             multiplicity=ctx.multiplicity,
             operation=ctx.operation,
             engine=ctx.engine,
-            model_name=(ctx.ml.model if ctx.ml else None),
-            task_name=(ctx.ml.task if ctx.ml else None),
-            device=(ctx.ml.device if ctx.ml else None),
-            bind=(ctx.ml.bind_address if ctx.ml else None),
+
+            # unified engine config threading
+            model_name=cfg.model_name,
+            task_name=cfg.task_name,
+            device=cfg.device,
+            bind=cfg.bind,
+
+            # pyscf-specific
+            basis=cfg.basis,
+            functional=cfg.functional,
+            engine_extras=cfg.extras,
         )
+
         return StepIO(step_dir=step_dir, input_files=input_files, output_files=output_files)
+
 
     def _resolve_ids_and_filter(
     self,
