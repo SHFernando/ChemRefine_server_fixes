@@ -1,10 +1,11 @@
+from __future__ import annotations
+
 import os
 import yaml
 import logging
 from .parse import ArgumentParser
 from .refine import StructureRefiner
 from .utils import Utility
-from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional
 from .orca_interface import OrcaInterface, OrcaJobSubmitter
@@ -28,9 +29,6 @@ from chemrefine.cache_utils import (
     build_step_fingerprint,
 )
 
-from __future__ import annotations
-from dataclasses import dataclass
-from typing import Any, Optional
 
 @dataclass
 class MLConfig:
