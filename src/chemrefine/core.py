@@ -192,32 +192,26 @@ class ChemRefiner:
 
 
     def prepare_subsequent_step_directory(
-        self,
-        step_number,
-        filtered_coordinates,
-        filtered_ids,
-        charge=None,
-        multiplicity=None,
-        operation="OPT+SP",
-        engine="dft",
-        model_name=None,
-        task_name=None,
-        device="cuda",
-        bind="127.0.0.1:8888",
-    ):
+    self,
+    step_number,
+    filtered_coordinates,
+    filtered_ids,
+    charge=None,
+    multiplicity=None,
+    operation="OPT+SP",
+    engine="dft",
+    model_name=None,
+    task_name=None,
+    device="cuda",
+    bind="127.0.0.1:8888",
+    # --- NEW (PySCF / engine-generic) ---
+    basis=None,
+    functional=None,
+    engine_extras=None,
+):
         """
         Prepares the directory for subsequent steps by writing XYZ files, copying the template input,
         and generating ORCA input files.
-
-        Args:
-            step_number (int): The current step number.
-            filtered_coordinates (list): Filtered coordinates from the previous step.
-            filtered_ids (list): Filtered IDs from the previous step.
-
-        Returns:
-            step_dir (str): Path to the step directory.
-            input_files (list): List of generated ORCA input files.
-            output_files (list): List of expected ORCA output files.
         """
         if charge is None:
             charge = self.charge
@@ -226,6 +220,9 @@ class ChemRefiner:
 
         step_dir = os.path.join(self.output_dir, f"step{step_number}")
         os.makedirs(step_dir, exist_ok=True)
+
+        eng = (engine or "dft").lower()
+        extras = engine_extras or {}
 
         # Write XYZ files in step_dir
         xyz_filenames = self.utils.write_xyz(
@@ -236,12 +233,10 @@ class ChemRefiner:
         input_template_src = os.path.join(self.template_dir, f"step{step_number}.inp")
         input_template_dst = os.path.join(step_dir, f"step{step_number}.inp")
         if not os.path.exists(input_template_src):
-            logging.warning(
-                f"Input file '{input_template_src}' not found. Exiting pipeline."
-            )
-            sys.exit(1)
+            logging.warning(f"Input file '{input_template_src}' not found. Exiting pipeline.")
             raise FileNotFoundError(
-                f"Input file '{input_template_src}' not found. Please ensure that 'step{step_number}.inp' exists in the template directory."
+                f"Input file '{input_template_src}' not found. Please ensure that "
+                f"'step{step_number}.inp' exists in the template directory."
             )
         shutil.copyfile(input_template_src, input_template_dst)
 
@@ -253,14 +248,23 @@ class ChemRefiner:
             multiplicity,
             output_dir=step_dir,
             operation=operation,
-            engine=engine,
+            engine=eng,
             model_name=model_name,
             task_name=task_name,
             device=device,
             bind=bind,
+
+            # NEW: PySCF client params (used only when engine == "pyscf")
+            basis=basis,
+            xc=(functional or extras.get("xc") or extras.get("functional")),
+            df=bool(extras.get("df", False)),
+            gpu=extras.get("gpu", None),                 # None => infer from device inside create_input
+            pyscf_method=extras.get("method", "dft"),
+            pyscf_prog=extras.get("prog", None),
         )
 
         return step_dir, input_files, output_files
+
 
     def parse_and_filter_outputs(
         self,
@@ -1329,7 +1333,7 @@ class ChemRefiner:
         return StepResult(coords=coords, ids=ids, energies=energies, forces=forces, output_files=io.output_files)
 
     def _prepare_step_io(self, ctx: StepContext, state: PipelineState) -> StepIO:
-        cfg = ctx.engine_cfg  # EngineConfig
+        cfg = ctx.engine_cfg or EngineConfig() # EngineConfig
 
         if ctx.step_number == 1:
             initial_xyz = self.config.get("initial_xyz", None)
