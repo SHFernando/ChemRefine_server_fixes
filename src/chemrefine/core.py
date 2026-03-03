@@ -1601,7 +1601,7 @@ class ChemRefiner:
         ctx.engine_cfg.bind = bind
         logging.info(f"[step {ctx.step_number}] Using bind {bind} (base {base_bind}).")
         
-    def _parse_bind(bind: str) -> Tuple[str, int]:
+    def _parse_bind(self,bind: str) -> Tuple[str, int]:
         """
         Parse "host:port" into (host, port).
 
@@ -1633,7 +1633,7 @@ class ChemRefiner:
         return host, port
 
 
-    def _format_bind(host: str, port: int) -> str:
+    def _format_bind(self,host: str, port: int) -> str:
         """
         Format host/port into "host:port".
         """
@@ -1652,6 +1652,7 @@ class ChemRefiner:
 
 
     def allocate_next_port(
+        self,
         *,
         base_port: int,
         namespace: str,
