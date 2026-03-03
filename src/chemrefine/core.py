@@ -1605,7 +1605,6 @@ class ChemRefiner:
         for step in self.config.get("steps", []):
             ctx = self._build_step_context(step)
             self._validate_step_context(ctx)
-            self._maybe_allocate_unique_bind(ctx)
             logging.info(
                 f"Processing step {ctx.step_number}: operation '{ctx.operation}', engine '{ctx.engine}'."
             )
