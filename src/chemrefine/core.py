@@ -1652,42 +1652,52 @@ class ChemRefiner:
 
 
     def allocate_next_port(
-        self,
-        *,
-        base_port: int,
-        namespace: str,
-        lock_dir: Path | str = "/tmp",
-    ) -> int:
+    self,
+    *,
+    base_port: int,
+    namespace: str,
+    lock_dir: str | Path = "/tmp",
+) -> int:
         """
         Atomically allocate the next port on this node, starting at base_port.
 
         Parameters
         ----------
         base_port
-            Starting port for allocation.
+            Starting port for allocation (e.g., 8888).
         namespace
-            A string to isolate counters between different projects/runs.
-            Example: "chemrefine" or "chemrefine_<jobid>".
+            Namespace for the counter file name to avoid collisions across projects/jobs.
         lock_dir
-            Node-local directory (default: /tmp).
+            Node-local directory for the lock/counter file (default: /tmp).
 
         Returns
         -------
         int
-            Allocated port.
+            Allocated port number.
 
         Raises
         ------
         RuntimeError
-            If fcntl is unavailable (non-Linux).
+            If fcntl is unavailable (non-Linux) or allocation fails.
         """
-        if fcntl is None:
-            raise RuntimeError("Port allocation requires fcntl (Linux).")
+        import json
+        import os
+        import socket
+        from pathlib import Path
+
+        try:
+            import fcntl  # type: ignore
+        except ImportError as e:  # pragma: no cover
+            raise RuntimeError("allocate_next_port requires fcntl (Linux).") from e
+
+        if not (1 <= int(base_port) <= 65535):
+            raise ValueError(f"base_port out of range: {base_port}")
 
         lock_dir = Path(lock_dir)
         lock_dir.mkdir(parents=True, exist_ok=True)
 
-        counter_path = lock_dir / f"{namespace}_port_counter_{_node_id()}.json"
+        node = socket.gethostname()
+        counter_path = lock_dir / f"{namespace}_port_counter_{node}.json"
 
         with open(counter_path, "a+", encoding="utf-8") as f:
             fcntl.flock(f.fileno(), fcntl.LOCK_EX)
@@ -1699,25 +1709,25 @@ class ChemRefiner:
                     next_port = int(data.get("next_port", base_port))
                     stored_base = int(data.get("base_port", base_port))
                 else:
-                    next_port = base_port
-                    stored_base = base_port
+                    next_port = int(base_port)
+                    stored_base = int(base_port)
 
-                # If base_port changes, reset counter to the new base.
-                if stored_base != base_port:
-                    next_port = base_port
+                # If base changes, reset to new base.
+                if stored_base != int(base_port):
+                    next_port = int(base_port)
 
                 allocated = next_port
                 next_port = allocated + 1
 
                 f.seek(0)
                 f.truncate()
-                json.dump({"base_port": base_port, "next_port": next_port}, f)
+                json.dump({"base_port": int(base_port), "next_port": int(next_port)}, f)
                 f.flush()
                 os.fsync(f.fileno())
             finally:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
-        return allocated
+        return int(allocated)
 
 
     def resolve_bind_for_run(
