@@ -1720,8 +1720,8 @@ class ChemRefiner:
 
 
     def resolve_bind_for_run(
-        *,
         self,
+        *,
         output_dir: str | Path,
         base_bind: str,
         namespace: str = "chemrefine",
