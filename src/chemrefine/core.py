@@ -1721,6 +1721,7 @@ class ChemRefiner:
 
     def resolve_bind_for_run(
         *,
+        self,
         output_dir: str | Path,
         base_bind: str,
         namespace: str = "chemrefine",
@@ -1755,14 +1756,14 @@ class ChemRefiner:
             if existing:
                 return existing
 
-        host, base_port = _parse_bind(base_bind)
+        host, base_port = self._parse_bind(base_bind)
 
         # Optional: isolate by job-id so separate jobs don't share a counter.
         job_id = os.environ.get("SLURM_JOB_ID") or os.environ.get("PBS_JOBID") or ""
         ns = f"{namespace}_{job_id}" if job_id else namespace
 
-        port = allocate_next_port(base_port=base_port, namespace=ns)
-        bind = _format_bind(host, port)
+        port = self.allocate_next_port(base_port=base_port, namespace=ns)
+        bind = self._format_bind(host, port)
 
         bind_file.write_text(bind + "\n", encoding="utf-8")
         return bind
