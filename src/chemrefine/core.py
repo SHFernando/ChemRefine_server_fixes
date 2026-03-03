@@ -5,8 +5,10 @@ import sys
 import glob
 import shutil
 import logging
-from typing import Any, Optional
-
+from typing import Any, Optional, Tuple
+import json
+import socket
+from pathlib import Path
 import yaml
 
 from .parse import ArgumentParser
@@ -190,7 +192,6 @@ class ChemRefiner:
 
         return step_dir, input_files, output_files, seed_ids
 
-
     def prepare_subsequent_step_directory(
     self,
     step_number,
@@ -264,7 +265,6 @@ class ChemRefiner:
         )
 
         return step_dir, input_files, output_files
-
 
     def parse_and_filter_outputs(
         self,
@@ -1192,7 +1192,6 @@ class ChemRefiner:
             step=step,
         )
 
-
     def _validate_step_context(self, ctx: StepContext) -> None:
         valid_operations = {
             "OPT+SP", "GOAT", "PES", "DOCKER", "SOLVATOR", "MLFF_TRAIN", "MLIP_TRAIN"
@@ -1391,7 +1390,6 @@ class ChemRefiner:
 
         return StepIO(step_dir=step_dir, input_files=input_files, output_files=output_files)
 
-
     def _resolve_ids_and_filter(
     self,
     *,
@@ -1497,6 +1495,8 @@ class ChemRefiner:
         logging.info(f"Normal mode sampling requested for step {ctx.step_number}.")
         input_template_path = os.path.join(self.template_dir, f"step{ctx.step_number}.inp")
 
+        cfg = ctx.engine_cfg  # EngineConfig
+
         coords, ids = self.orca.normal_mode_sampling(
             file_paths=output_files,
             calc_type=calc_type,
@@ -1507,15 +1507,19 @@ class ChemRefiner:
             output_dir=self.output_dir,
             operation=ctx.operation,
             engine=ctx.engine,
-            model_name=(ctx.ml.model if ctx.ml else None),
+
+            # --- MLFF/MLIP/PySCF config comes from engine_cfg ---
+            model_name=cfg.model_name,
             step_number=ctx.step_number,
             structure_ids=result.ids,
             max_cores=self.max_cores,
-            task_name=(ctx.ml.task if ctx.ml else None),
-            mlff_model=(ctx.ml.model if ctx.ml else None),
+            task_name=cfg.task_name,
+            mlff_model=cfg.model_name,          # keep if your API expects a separate field; otherwise drop
             displacement_value=displacement_vector,
-            device=(ctx.ml.device if ctx.ml else None),
-            bind=(ctx.ml.bind_address if ctx.ml else None),
+            device=cfg.device,
+            bind=cfg.bind,
+
+            # --- ORCA execution ---
             orca_executable=self.orca_executable,
             scratch_dir=self.scratch_dir,
             num_random_modes=nms_random_displacements,
@@ -1563,6 +1567,206 @@ class ChemRefiner:
         else:
             logging.info(f"[step {ctx.step_number}] Skipping CSV export (energy/ID mismatch or missing energies).")
 
+    def _maybe_allocate_unique_bind(self, ctx: StepContext) -> None:
+        """
+        Allocate a unique node-local bind for MLFF/MLIP/PySCF to avoid port collisions.
+
+        Behavior
+        --------
+        - Uses ctx.engine_cfg.bind as the *base* (e.g., 127.0.0.1:8888).
+        - Allocates a unique port on the node (atomic counter in /tmp).
+        - Persists the chosen bind to: <output_dir>/.bind
+        so all steps in the same pipeline reuse the same bind.
+
+        Notes
+        -----
+        This should run before any step directory / input generation that embeds the bind.
+        """
+        if ctx.engine not in {"mlff", "mlip", "pyscf"}:
+            return
+
+        # Only allocate once per pipeline output_dir; reuse afterwards
+        base_bind = getattr(ctx.engine_cfg, "bind", None) or "127.0.0.1:8888"
+
+        try:
+            bind = resolve_bind_for_run(
+                output_dir=Path(self.output_dir),
+                base_bind=base_bind,
+                namespace="chemrefine",
+            )
+        except Exception as e:
+            # Fail fast is better than silent collisions; but keep message clear.
+            raise RuntimeError(f"Failed to allocate unique bind (base={base_bind}): {e}") from e
+
+        ctx.engine_cfg.bind = bind
+        logging.info(f"[step {ctx.step_number}] Using bind {bind} (base {base_bind}).")
+        
+    def _parse_bind(bind: str) -> Tuple[str, int]:
+        """
+        Parse "host:port" into (host, port).
+
+        Parameters
+        ----------
+        bind
+            Bind string, e.g. "127.0.0.1:8888".
+
+        Returns
+        -------
+        (host, port)
+            Host and port.
+
+        Raises
+        ------
+        ValueError
+            If the bind string is invalid.
+        """
+        if not isinstance(bind, str) or ":" not in bind:
+            raise ValueError(f"Invalid bind '{bind}'. Expected 'host:port'.")
+        host, port_s = bind.rsplit(":", 1)
+        host = host.strip()
+        port_s = port_s.strip()
+        if not host:
+            raise ValueError(f"Invalid bind '{bind}'. Empty host.")
+        port = int(port_s)
+        if not (1 <= port <= 65535):
+            raise ValueError(f"Invalid bind '{bind}'. Port out of range.")
+        return host, port
+
+
+    def _format_bind(host: str, port: int) -> str:
+        """
+        Format host/port into "host:port".
+        """
+        return f"{host}:{port}"
+
+
+    def _node_id() -> str:
+        """
+        Return a stable node identifier.
+
+        Notes
+        -----
+        Using hostname is sufficient for node-local /tmp locks.
+        """
+        return socket.gethostname()
+
+
+    def allocate_next_port(
+        *,
+        base_port: int,
+        namespace: str,
+        lock_dir: Path | str = "/tmp",
+    ) -> int:
+        """
+        Atomically allocate the next port on this node, starting at base_port.
+
+        Parameters
+        ----------
+        base_port
+            Starting port for allocation.
+        namespace
+            A string to isolate counters between different projects/runs.
+            Example: "chemrefine" or "chemrefine_<jobid>".
+        lock_dir
+            Node-local directory (default: /tmp).
+
+        Returns
+        -------
+        int
+            Allocated port.
+
+        Raises
+        ------
+        RuntimeError
+            If fcntl is unavailable (non-Linux).
+        """
+        if fcntl is None:
+            raise RuntimeError("Port allocation requires fcntl (Linux).")
+
+        lock_dir = Path(lock_dir)
+        lock_dir.mkdir(parents=True, exist_ok=True)
+
+        counter_path = lock_dir / f"{namespace}_port_counter_{_node_id()}.json"
+
+        with open(counter_path, "a+", encoding="utf-8") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                f.seek(0)
+                raw = f.read().strip()
+                if raw:
+                    data = json.loads(raw)
+                    next_port = int(data.get("next_port", base_port))
+                    stored_base = int(data.get("base_port", base_port))
+                else:
+                    next_port = base_port
+                    stored_base = base_port
+
+                # If base_port changes, reset counter to the new base.
+                if stored_base != base_port:
+                    next_port = base_port
+
+                allocated = next_port
+                next_port = allocated + 1
+
+                f.seek(0)
+                f.truncate()
+                json.dump({"base_port": base_port, "next_port": next_port}, f)
+                f.flush()
+                os.fsync(f.fileno())
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+        return allocated
+
+
+    def resolve_bind_for_run(
+        *,
+        output_dir: str | Path,
+        base_bind: str,
+        namespace: str = "chemrefine",
+    ) -> str:
+        """
+        Resolve a stable, unique bind for this run.
+
+        This will:
+        1) Reuse an existing bind recorded in output_dir/.bind if present.
+        2) Otherwise, allocate a new port (node-local counter) and persist it.
+
+        Parameters
+        ----------
+        output_dir
+            The pipeline output directory for this run.
+        base_bind
+            The base bind (host:port) to start counting from.
+        namespace
+            Lock/counter namespace (consider adding SLURM_JOB_ID if you want per-job isolation).
+
+        Returns
+        -------
+        str
+            A bind string "host:port".
+        """
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        bind_file = output_dir / ".bind"
+
+        if bind_file.exists():
+            existing = bind_file.read_text(encoding="utf-8").strip()
+            if existing:
+                return existing
+
+        host, base_port = _parse_bind(base_bind)
+
+        # Optional: isolate by job-id so separate jobs don't share a counter.
+        job_id = os.environ.get("SLURM_JOB_ID") or os.environ.get("PBS_JOBID") or ""
+        ns = f"{namespace}_{job_id}" if job_id else namespace
+
+        port = allocate_next_port(base_port=base_port, namespace=ns)
+        bind = _format_bind(host, port)
+
+        bind_file.write_text(bind + "\n", encoding="utf-8")
+        return bind
+
 
     def run(self) -> None:
         """Main pipeline execution function for ChemRefine."""
@@ -1576,7 +1780,7 @@ class ChemRefiner:
         for step in self.config.get("steps", []):
             ctx = self._build_step_context(step)
             self._validate_step_context(ctx)
-
+            self._maybe_allocate_unique_bind(ctx)
             logging.info(
                 f"Processing step {ctx.step_number}: operation '{ctx.operation}', engine '{ctx.engine}'."
             )
