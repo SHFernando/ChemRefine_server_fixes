@@ -10,7 +10,7 @@ import json
 import socket
 from pathlib import Path
 import yaml
-
+import fcntl
 from .parse import ArgumentParser
 from .refine import StructureRefiner
 from .utils import Utility
