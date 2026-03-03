@@ -1589,7 +1589,7 @@ class ChemRefiner:
         base_bind = getattr(ctx.engine_cfg, "bind", None) or "127.0.0.1:8888"
 
         try:
-            bind = resolve_bind_for_run(
+            bind = self.resolve_bind_for_run(
                 output_dir=Path(self.output_dir),
                 base_bind=base_bind,
                 namespace="chemrefine",
