@@ -108,13 +108,15 @@ class ChemRefiner:
     device="cpu",
     bind="127.0.0.1:8888",
     basis=None,
-    functional=None,       # or pass xc via engine_extras
-    engine_extras=None,    # dict, e.g. pyscf: {df: true, gpu: true, method: dft, prog: ...}
+    functional=None,
+    engine_extras=None,
 ):
         """
         Prepare the directory for the first step by copying one or more initial XYZ files,
         or generating XYZ files from a CSV of SMILES strings. Produces input/output files
         and assigns seed IDs (one per XYZ).
+
+        Each input receives a unique bind: base_port + i.
         """
         if charge is None:
             charge = self.charge
@@ -163,31 +165,47 @@ class ChemRefiner:
                 f"Input file '{template_inp}' not found. Please ensure it exists."
             )
 
-        # --- Generate inputs/outputs ---
-        # Pass through pyscf knobs only when relevant (create_input can also ignore extras safely)
-        input_files, output_files = self.orca.create_input(
-            xyz_filenames,
-            template_inp,
-            charge,
-            multiplicity,
-            output_dir=step_dir,
-            operation=operation,
-            engine=eng,
-            model_name=model_name,
-            task_name=task_name,
-            device=device,
-            bind=bind,
+        # ---- parse bind base ----
+        try:
+            bind_host, bind_port_str = bind.rsplit(":", 1)
+            base_port = int(bind_port_str)
+        except Exception as e:
+            raise ValueError(f"Invalid bind '{bind}'. Expected 'host:port'.") from e
 
-            # NEW: PySCF external method support
-            basis=basis,
-            xc=(functional or extras.get("xc") or extras.get("functional")),
-            df=bool(extras.get("df", False)),
-            gpu=extras.get("gpu", None),                 # None => infer from device in create_input
-            pyscf_method=extras.get("method", "dft"),
-            pyscf_prog=extras.get("prog", None),
-        )
+        input_files = []
+        output_files = []
 
-        # --- Assign seed IDs (one per input structure) ---
+        # --- Generate inputs with bind_i ---
+        for i, xyz in enumerate(xyz_filenames):
+
+            bind_i = f"{bind_host}:{base_port + i}"
+
+            inp_i, out_i = self.orca.create_input(
+                [xyz],
+                template_inp,
+                charge,
+                multiplicity,
+                output_dir=step_dir,
+                operation=operation,
+                engine=eng,
+                model_name=model_name,
+                task_name=task_name,
+                device=device,
+                bind=bind_i,
+
+                # PySCF external method support
+                basis=basis,
+                xc=(functional or extras.get("xc") or extras.get("functional")),
+                df=bool(extras.get("df", False)),
+                gpu=extras.get("gpu", None),
+                pyscf_method=extras.get("method", "dft"),
+                pyscf_prog=extras.get("prog", None),
+            )
+
+            input_files.extend(inp_i)
+            output_files.extend(out_i)
+
+        # --- Assign seed IDs ---
         seed_ids = list(range(len(input_files)))
 
         return step_dir, input_files, output_files, seed_ids
