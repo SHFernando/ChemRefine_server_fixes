@@ -208,7 +208,7 @@ class ChemRefiner:
         # --- Assign seed IDs ---
         seed_ids = list(range(len(input_files)))
 
-        return step_dir, input_files, output_files, seed_ids
+        return step_dir, input_files, output_files, seed_ids, binds
 
     def prepare_subsequent_step_directory(
     self,
@@ -308,7 +308,7 @@ class ChemRefiner:
             input_files.extend(inp_i)
             output_files.extend(out_i)
             binds[inp_i[0]] = bind_i  # assuming one input per xyz
-        return step_dir, input_files, output_files
+        return step_dir, input_files, output_files,binds
 
     def parse_and_filter_outputs(
         self,
