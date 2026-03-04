@@ -204,7 +204,7 @@ class ChemRefiner:
 
             input_files.extend(inp_i)
             output_files.extend(out_i)
-            binds[inp_i[0]] = bind_i  # assuming one input per xyz
+            binds[str(Path(inp_i[0]).resolve())] = bind_i
         # --- Assign seed IDs ---
         seed_ids = list(range(len(input_files)))
 
@@ -307,7 +307,7 @@ class ChemRefiner:
             # create_input returns lists
             input_files.extend(inp_i)
             output_files.extend(out_i)
-            binds[inp_i[0]] = bind_i  # assuming one input per xyz
+            binds[str(Path(inp_i[0]).resolve())] = bind_i
         return step_dir, input_files, output_files,binds
 
     def parse_and_filter_outputs(
@@ -366,21 +366,15 @@ class ChemRefiner:
     step_dir,
     operation="OPT+SP",
     engine="dft",
-    engine_cfg=None,  # EngineConfig
+    engine_cfg=None,
     binds: dict[str, str] | None = None,
 ):
         """
         Submit ORCA jobs for a step.
 
-        Behavior
-        --------
-        - For standard DFT jobs (engine == "dft"): submit all inputs in a single batch.
-        - For external server/client engines (mlff/mlip/pyscf): submit one input at a time so
-        each SLURM script uses the correct bind for that input.
+        - DFT: batch submit as usual.
+        - MLFF/MLIP/PySCF: batch submit, but per-input binds are used when writing SLURM scripts.
         """
-        import os
-        import logging
-
         engine = (engine or "dft").lower()
 
         device = getattr(engine_cfg, "device", None) or "cpu"
@@ -396,81 +390,18 @@ class ChemRefiner:
         logging.info(f"Switching to working directory: {step_dir}")
         original_dir = os.getcwd()
         os.chdir(step_dir)
-        logging.info(f"Current working directory: {os.getcwd()}")
-        logging.info(f"Running in {self.scratch_dir} from submit_orca_jobs helper function.")
 
         try:
-            logging.info(
-                f"Submitting ORCA jobs in {step_dir} with {len(input_files)} input files "
-                f"using device={device}, engine={engine}, operation={operation}."
-            )
-
-            # -----------------------------
-            # Case 1: standard DFT (no bind)
-            # -----------------------------
-            if engine == "dft":
-                self.orca_submitter = OrcaJobSubmitter(
-                    scratch_dir=self.scratch_dir,
-                    orca_executable=self.orca_executable,
-                    device=device,
-                    bind=default_bind,  # unused for pure dft, but harmless
-                    basis=basis,
-                    functional=functional,
-                )
-                self.orca_submitter.submit_files(
-                    input_files=input_files,
-                    max_cores=max_cores,
-                    template_dir=self.template_dir,
-                    output_dir=step_dir,
-                    engine=engine,
-                    operation=operation,
-                    model_name=model_name,
-                    task_name=task_name,
-                    model_path=model_path,
-                )
-                return
-
-            # ------------------------------------------
-            # Case 2: external engines (need per-input bind)
-            # ------------------------------------------
-            if engine in {"mlff", "mlip", "pyscf"}:
-                for inp in input_files:
-                    # IMPORTANT: match how you keyed binds (full path vs basename)
-                    bind_i = binds.get(inp, default_bind)
-
-                    submitter = OrcaJobSubmitter(
-                        scratch_dir=self.scratch_dir,
-                        orca_executable=self.orca_executable,
-                        device=device,
-                        bind=bind_i,
-                        basis=basis,
-                        functional=functional,
-                    )
-
-                    submitter.submit_files(
-                        input_files=[inp],
-                        max_cores=max_cores,
-                        template_dir=self.template_dir,
-                        output_dir=step_dir,
-                        engine=engine,
-                        operation=operation,
-                        model_name=model_name,
-                        task_name=task_name,
-                        model_path=model_path,
-                    )
-                return
-
-            # ------------------------------------------
-            # Fallback: treat unknown engines like batch
-            # ------------------------------------------
             self.orca_submitter = OrcaJobSubmitter(
                 scratch_dir=self.scratch_dir,
                 orca_executable=self.orca_executable,
                 device=device,
-                bind=default_bind,
+                bind=default_bind,  # fallback only
                 basis=basis,
                 functional=functional,
             )
+
+            # IMPORTANT: submit in one batch and DO NOT WAIT
             self.orca_submitter.submit_files(
                 input_files=input_files,
                 max_cores=max_cores,
@@ -481,14 +412,11 @@ class ChemRefiner:
                 model_name=model_name,
                 task_name=task_name,
                 model_path=model_path,
+                binds=binds,     # <-- NEW
             )
 
-        except Exception as e:
-            logging.error(f"Error while submitting ORCA jobs in {step_dir}: {str(e)}")
-            raise
         finally:
             os.chdir(original_dir)
-            logging.info(f"Returned to original directory: {original_dir}")
 
     def run_mlff_train(
         self, step_number, step, last_coords, last_ids, last_energies, last_forces

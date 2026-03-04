@@ -63,30 +63,56 @@ class OrcaJobSubmitter:
         self.functional = functional
         
     def submit_files(
-        self,
-        input_files,
-        max_cores=32,
-        template_dir=".",
-        output_dir=".",
-        device=None,
-        operation="OPT+SP",
-        engine="dft",
-        model_name=None,
-        task_name=None,
-        model_path=None,
-    ):
+    self,
+    input_files,
+    max_cores=32,
+    template_dir=".",
+    output_dir=".",
+    device=None,
+    operation="OPT+SP",
+    engine="dft",
+    model_name=None,
+    task_name=None,
+    model_path=None,
+    *,
+    binds: dict[str, str] | None = None,
+    wait: bool = True,
+):
         """
-        Submits multiple ORCA input files to SLURM, managing PAL values, active job tracking,
-        and ensuring that the total PAL usage does not exceed max_cores.
+        Submit multiple ORCA input files to SLURM.
 
-        Args:
-            input_files (list): List of ORCA input file paths.
-            max_cores (int): Maximum total PAL usage allowed.
-            template_dir (str): Directory containing SLURM header template.
-            output_dir (str): Output directory for SLURM scripts and results.
+        Parameters
+        ----------
+        input_files
+            List of ORCA input file paths.
+        max_cores
+            Maximum total PAL usage allowed for concurrently running jobs.
+        template_dir
+            Directory containing SLURM header template.
+        output_dir
+            Output directory for SLURM scripts and results.
+        device
+            Optional device override. If None, uses self.device.
+        operation, engine, model_name, task_name, model_path
+            Passed through to SLURM script generation.
+        binds
+            Optional mapping of input_file -> bind ("host:port"). If not provided, falls back
+            to self.bind for all scripts.
+        wait
+            If True, block until all submitted jobs are complete (current behavior).
+            If False, submit jobs (respecting max_cores throttling) and return immediately.
+
+        Returns
+        -------
+        dict[str, str]
+            Mapping of input file path -> submitted job id (only for jobs with numeric IDs).
         """
         total_cores_used = 0
-        active_jobs = {}
+        active_jobs: dict[str, int] = {}
+        job_ids_by_input: dict[str, str] = {}
+
+        binds = binds or {}
+        dev = device if device is not None else self.device
 
         for input_file in input_files:
             input_path = Path(input_file).resolve()
@@ -109,17 +135,20 @@ class OrcaJobSubmitter:
 
                 time.sleep(10)
 
+            # ---- PER-INPUT BIND HERE ----
+            bind_i = binds.get(str(input_path), binds.get(input_path.name, self.bind))
+
             slurm_script = self.generate_slurm_script(
                 input_file=input_path,
                 pal_value=pal_value,
                 template_dir=template_dir,
                 output_dir=output_dir,
-                device=self.device,
+                device=dev,
                 model_name=model_name,
                 task_name=task_name,
                 operation=operation,
                 engine=engine,
-                bind=self.bind,
+                bind=bind_i,                 # <-- use per-input bind
                 model_path=model_path,
                 basis=self.basis,
                 functional=self.functional,
@@ -127,15 +156,19 @@ class OrcaJobSubmitter:
 
             job_id = self.utility.submit_job(slurm_script)
             time.sleep(3)
-            logging.info(
-                f"Submitted ORCA job with ID: {job_id} for input: {input_path.name}"
-            )
+            logging.info(f"Submitted ORCA job with ID: {job_id} for input: {input_path.name}")
 
-            if job_id.isdigit():
+            if isinstance(job_id, str) and job_id.isdigit():
                 active_jobs[job_id] = pal_value
                 total_cores_used += pal_value
+                job_ids_by_input[str(input_path)] = job_id
             else:
                 logging.warning(f"Skipping job tracking for invalid job ID '{job_id}'")
+
+        # ---- IMPORTANT CHANGE: only wait if requested ----
+        if not wait:
+            logging.info("All jobs submitted (non-blocking mode).")
+            return job_ids_by_input
 
         logging.info("All jobs submitted. Waiting for remaining jobs to complete...")
         while active_jobs:
@@ -152,6 +185,7 @@ class OrcaJobSubmitter:
             time.sleep(30)
 
         logging.info("All calculations finished.")
+        return job_ids_by_input
 
     def parse_pal_from_input(self, input_file: Path):
         """
@@ -296,12 +330,14 @@ class OrcaJobSubmitter:
                 f.write("# Start MLFF socket server before ORCA\n")
                 if model_path:
                     f.write(
-                        f"python -m chemrefine.server --model-path {model_path} --device {device} --bind {bind} & > $OUTPUT_DIR/server.log 2>&1 & \n"
-                    )
+                            f"python -m chemrefine.server --model-path {model_path} --device {device} --bind {bind} "
+                            f"> $OUTPUT_DIR/server.log 2>&1 &\n"
+                            )
                 else:
                     f.write(
-                        f"python -m chemrefine.server --model {model_name} --task-name {task_name} --device {device} --bind {bind} & > $OUTPUT_DIR/server.log 2>&1 & \n"
-                    )
+                        f"python -m chemrefine.server --model {model_name} --task-name {task_name} --device {device} --bind {bind} "
+                        f"> $OUTPUT_DIR/server.log 2>&1 &\n"
+                        )
 
                 f.write("SERVER_PID=$!\n")
                 f.write("trap 'kill $SERVER_PID 2>/dev/null' EXIT\n")
@@ -309,7 +345,6 @@ class OrcaJobSubmitter:
                 f.write(
                     f"$ORCA_EXEC {input_file.name} > $OUTPUT_DIR/{job_name}.out || {{ echo 'Error: ORCA execution failed.'; kill $SERVER_PID; exit 1; }}\n"
                 )
-                f.write("kill $SERVER_PID\n\n")
             
             elif engine.lower() == "pyscf":
                 f.write("# Start PySCF server before ORCA (external backend)\n")
@@ -333,7 +368,6 @@ class OrcaJobSubmitter:
                     f"$ORCA_EXEC {input_file.name} > $OUTPUT_DIR/{job_name}.out "
                     "|| { echo 'Error: ORCA execution failed.'; kill $SERVER_PID; exit 1; }\n"
                 )
-                f.write("kill $SERVER_PID\n\n")
 
 
 
