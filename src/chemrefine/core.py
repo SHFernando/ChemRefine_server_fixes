@@ -1586,7 +1586,7 @@ class ChemRefiner:
         """Format (host, port) into 'host:port'."""
         return f"{host}:{port}"
 
-    def _increment_bind(self, bind: str, delta: int) -> str:
+    def _increment_bind(self, bind: str, delta=1) -> str:
         """Return bind with port increased by delta."""
         host, port = self._parse_bind(bind)
         return self._format_bind(host, port + int(delta))
