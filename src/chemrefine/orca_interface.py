@@ -370,6 +370,7 @@ class OrcaJobSubmitter:
                     f"$ORCA_EXEC {input_file.name} > $OUTPUT_DIR/{job_name}.out "
                     "|| { echo 'Error: ORCA execution failed.'; kill $SERVER_PID; exit 1; }\n"
                 )
+                f.write("kill $SERVER_PID\n\n")
 
 
 
@@ -378,6 +379,7 @@ class OrcaJobSubmitter:
                 f.write(
                     f"$ORCA_EXEC {input_file.name} > $OUTPUT_DIR/{job_name}.out || {{ echo 'Error: ORCA execution failed.'; exit 1; }}\n\n"
                 )
+                f.write("kill $SERVER_PID\n\n")
 
             # File copy commands
             f.write("cp *.out *.xyz *.xyz $OUTPUT_DIR \n")
