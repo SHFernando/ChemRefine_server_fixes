@@ -112,11 +112,8 @@ class ChemRefiner:
     engine_extras=None,
 ):
         """
-        Prepare the directory for the first step by copying one or more initial XYZ files,
-        or generating XYZ files from a CSV of SMILES strings. Produces input/output files
-        and assigns seed IDs (one per XYZ).
-
-        Each input receives a unique bind: base_port + i.
+        Prepare step1 directory. For ML engines, assign a unique bind per initial structure.
+        Returns (step_dir, input_files, output_files, seed_ids, binds).
         """
         if charge is None:
             charge = self.charge
@@ -129,26 +126,22 @@ class ChemRefiner:
         eng = (engine or "dft").lower()
         extras = engine_extras or {}
 
-        # --- Discover/generate initial xyz files ---
+        # discover initial xyz files (your existing logic)
         if initial_xyz is None:
             src_xyz_files = [os.path.join(self.template_dir, "step1.xyz")]
-
         elif os.path.isdir(initial_xyz):
             src_xyz_files = sorted(
                 f for f in glob.glob(os.path.join(initial_xyz, "*.xyz")) if os.path.isfile(f)
             )
             if not src_xyz_files:
                 raise FileNotFoundError(f"No .xyz files found in directory '{initial_xyz}'.")
-
         elif initial_xyz.endswith(".csv"):
             src_xyz_files = smiles_to_xyz(initial_xyz, step_dir)
             if not src_xyz_files:
                 raise ValueError(f"No SMILES could be converted from '{initial_xyz}'.")
-
         else:
             src_xyz_files = [initial_xyz]
 
-        # --- Copy/normalize names into step_dir ---
         xyz_filenames = []
         for idx, src in enumerate(src_xyz_files):
             if not os.path.exists(src):
@@ -158,27 +151,18 @@ class ChemRefiner:
                 shutil.copyfile(src, dst)
             xyz_filenames.append(dst)
 
-        # --- Input template ---
         template_inp = os.path.join(self.template_dir, "step1.inp")
         if not os.path.exists(template_inp):
-            raise FileNotFoundError(
-                f"Input file '{template_inp}' not found. Please ensure it exists."
-            )
+            raise FileNotFoundError(f"Input file '{template_inp}' not found.")
 
-        # ---- parse bind base ----
-        try:
-            bind_host, bind_port_str = bind.rsplit(":", 1)
-            base_port = int(bind_port_str)
-        except Exception as e:
-            raise ValueError(f"Invalid bind '{bind}'. Expected 'host:port'.") from e
+        input_files: list[str] = []
+        output_files: list[str] = []
+        binds: dict[str, str] = {}
 
-        input_files = []
-        output_files = []
-        binds = {}
-        # --- Generate inputs with bind_i ---
+        needs_bind = eng in {"mlff", "mlip", "pyscf"}
+
         for i, xyz in enumerate(xyz_filenames):
-
-            bind_i = f"{bind_host}:{base_port + i}"
+            bind_i = self._increment_bind(bind, i) if needs_bind else bind
 
             inp_i, out_i = self.orca.create_input(
                 [xyz],
@@ -192,8 +176,6 @@ class ChemRefiner:
                 task_name=task_name,
                 device=device,
                 bind=bind_i,
-
-                # PySCF external method support
                 basis=basis,
                 xc=(functional or extras.get("xc") or extras.get("functional")),
                 df=bool(extras.get("df", False)),
@@ -205,9 +187,8 @@ class ChemRefiner:
             input_files.extend(inp_i)
             output_files.extend(out_i)
             binds[str(Path(inp_i[0]).resolve())] = bind_i
-        # --- Assign seed IDs ---
-        seed_ids = list(range(len(input_files)))
 
+        seed_ids = list(range(len(input_files)))
         return step_dir, input_files, output_files, seed_ids, binds
 
     def prepare_subsequent_step_directory(
@@ -223,24 +204,17 @@ class ChemRefiner:
     task_name=None,
     device="cuda",
     bind="127.0.0.1:8888",
-    # --- NEW (PySCF / engine-generic) ---
     basis=None,
     functional=None,
     engine_extras=None,
 ):
         """
-        Prepare the directory for subsequent steps by writing XYZ files, copying the template input,
-        and generating ORCA input files.
+        Prepare a subsequent step directory and generate ORCA inputs/outputs.
 
-        Notes
-        -----
-        This version assigns a unique bind per input (base_port + i) so that parallel jobs
-        on the same node do not collide when using external server/client engines.
+        For MLFF/MLIP/PySCF engines, assigns a unique bind per input structure by
+        incrementing the base port (bind) by the structure index, and returns a
+        mapping from resolved input file path -> bind.
         """
-        import os
-        import shutil
-        import logging
-
         if charge is None:
             charge = self.charge
         if multiplicity is None:
@@ -252,38 +226,30 @@ class ChemRefiner:
         eng = (engine or "dft").lower()
         extras = engine_extras or {}
 
-        # Write XYZ files in step_dir
         xyz_filenames = self.utils.write_xyz(
             filtered_coordinates, step_number, filtered_ids, output_dir=step_dir
         )
 
-        # Copy the template input file from template_dir to step_dir
         input_template_src = os.path.join(self.template_dir, f"step{step_number}.inp")
         input_template_dst = os.path.join(step_dir, f"step{step_number}.inp")
         if not os.path.exists(input_template_src):
-            logging.warning(f"Input file '{input_template_src}' not found. Exiting pipeline.")
             raise FileNotFoundError(
-                f"Input file '{input_template_src}' not found. Please ensure that "
-                f"'step{step_number}.inp' exists in the template directory."
+                f"Input file '{input_template_src}' not found. Please ensure it exists."
             )
         shutil.copyfile(input_template_src, input_template_dst)
 
-        # ---- bind per input: base_port + i ----
-        try:
-            bind_host, bind_port_str = bind.rsplit(":", 1)
-            base_port = int(bind_port_str)
-        except Exception as e:
-            raise ValueError(f"Invalid bind '{bind}'. Expected 'host:port'.") from e
-
         input_files: list[str] = []
         output_files: list[str] = []
-        binds = {}
-        # Create ORCA input files in step_dir (one-by-one so each gets a unique bind)
+        binds: dict[str, str] = {}
+
+        # Only engines that use server/client need per-input binds
+        needs_bind = eng in {"mlff", "mlip", "pyscf"}
+
         for i, xyz in enumerate(xyz_filenames):
-            bind_i = f"{bind_host}:{base_port + i}"
+            bind_i = self._increment_bind(bind, i) if needs_bind else bind
 
             inp_i, out_i = self.orca.create_input(
-                [xyz],  # one xyz -> one input with bind_i
+                [xyz],
                 input_template_dst,
                 charge,
                 multiplicity,
@@ -294,21 +260,21 @@ class ChemRefiner:
                 task_name=task_name,
                 device=device,
                 bind=bind_i,
-
-                # NEW: PySCF client params (used only when engine == "pyscf")
                 basis=basis,
                 xc=(functional or extras.get("xc") or extras.get("functional")),
                 df=bool(extras.get("df", False)),
-                gpu=extras.get("gpu", None),  # None => infer from device inside create_input
+                gpu=extras.get("gpu", None),
                 pyscf_method=extras.get("method", "dft"),
                 pyscf_prog=extras.get("prog", None),
             )
 
-            # create_input returns lists
             input_files.extend(inp_i)
             output_files.extend(out_i)
+
+            # Key by resolved input path so submitter can look it up reliably
             binds[str(Path(inp_i[0]).resolve())] = bind_i
-        return step_dir, input_files, output_files,binds
+
+        return step_dir, input_files, output_files, binds
 
     def parse_and_filter_outputs(
         self,
@@ -1344,7 +1310,8 @@ class ChemRefiner:
             step_dir=io.step_dir,
             operation=ctx.operation,
             engine=ctx.engine,
-            engine_cfg=ctx.engine_cfg,   
+            engine_cfg=ctx.engine_cfg,  
+            binds=io.binds, 
         )
 
 
@@ -1610,27 +1577,19 @@ class ChemRefiner:
         else:
             logging.info(f"[step {ctx.step_number}] Skipping CSV export (energy/ID mismatch or missing energies).")
 
-    def _increment_bind(self, base_bind: str) -> str:
-        """
-        Increment the port of a bind string by 1 for each call.
+    def _parse_bind(self, bind: str) -> tuple[str, int]:
+        """Parse 'host:port' into (host, port)."""
+        host, port_s = bind.split(":")
+        return host.strip(), int(port_s)
 
-        Example
-        -------
-        base_bind = "127.0.0.1:8888"
+    def _format_bind(self, host: str, port: int) -> str:
+        """Format (host, port) into 'host:port'."""
+        return f"{host}:{port}"
 
-        Returns:
-            127.0.0.1:8888
-            127.0.0.1:8889
-            127.0.0.1:8890
-            ...
-        """
-        host, port_str = base_bind.rsplit(":", 1)
-        port = int(port_str)
-
-        new_port = port + self._bind_counter
-        self._bind_counter += 1
-
-        return f"{host}:{new_port}"
+    def _increment_bind(self, bind: str, delta: int) -> str:
+        """Return bind with port increased by delta."""
+        host, port = self._parse_bind(bind)
+        return self._format_bind(host, port + int(delta))
 
     def run(self) -> None:
         """Main pipeline execution function for ChemRefine."""
