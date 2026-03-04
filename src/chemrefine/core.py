@@ -211,9 +211,18 @@ class ChemRefiner:
     engine_extras=None,
 ):
         """
-        Prepares the directory for subsequent steps by writing XYZ files, copying the template input,
+        Prepare the directory for subsequent steps by writing XYZ files, copying the template input,
         and generating ORCA input files.
+
+        Notes
+        -----
+        This version assigns a unique bind per input (base_port + i) so that parallel jobs
+        on the same node do not collide when using external server/client engines.
         """
+        import os
+        import shutil
+        import logging
+
         if charge is None:
             charge = self.charge
         if multiplicity is None:
@@ -241,28 +250,45 @@ class ChemRefiner:
             )
         shutil.copyfile(input_template_src, input_template_dst)
 
-        # Create ORCA input files in step_dir
-        input_files, output_files = self.orca.create_input(
-            xyz_filenames,
-            input_template_dst,
-            charge,
-            multiplicity,
-            output_dir=step_dir,
-            operation=operation,
-            engine=eng,
-            model_name=model_name,
-            task_name=task_name,
-            device=device,
-            bind=bind,
+        # ---- bind per input: base_port + i ----
+        try:
+            bind_host, bind_port_str = bind.rsplit(":", 1)
+            base_port = int(bind_port_str)
+        except Exception as e:
+            raise ValueError(f"Invalid bind '{bind}'. Expected 'host:port'.") from e
 
-            # NEW: PySCF client params (used only when engine == "pyscf")
-            basis=basis,
-            xc=(functional or extras.get("xc") or extras.get("functional")),
-            df=bool(extras.get("df", False)),
-            gpu=extras.get("gpu", None),                 # None => infer from device inside create_input
-            pyscf_method=extras.get("method", "dft"),
-            pyscf_prog=extras.get("prog", None),
-        )
+        input_files: list[str] = []
+        output_files: list[str] = []
+
+        # Create ORCA input files in step_dir (one-by-one so each gets a unique bind)
+        for i, xyz in enumerate(xyz_filenames):
+            bind_i = f"{bind_host}:{base_port + i}"
+
+            inp_i, out_i = self.orca.create_input(
+                [xyz],  # one xyz -> one input with bind_i
+                input_template_dst,
+                charge,
+                multiplicity,
+                output_dir=step_dir,
+                operation=operation,
+                engine=eng,
+                model_name=model_name,
+                task_name=task_name,
+                device=device,
+                bind=bind_i,
+
+                # NEW: PySCF client params (used only when engine == "pyscf")
+                basis=basis,
+                xc=(functional or extras.get("xc") or extras.get("functional")),
+                df=bool(extras.get("df", False)),
+                gpu=extras.get("gpu", None),  # None => infer from device inside create_input
+                pyscf_method=extras.get("method", "dft"),
+                pyscf_prog=extras.get("prog", None),
+            )
+
+            # create_input returns lists
+            input_files.extend(inp_i)
+            output_files.extend(out_i)
 
         return step_dir, input_files, output_files
 
