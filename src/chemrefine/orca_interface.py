@@ -119,6 +119,8 @@ class OrcaJobSubmitter:
             pal_value = self.parse_pal_from_input(input_path)
             pal_value = min(pal_value, max_cores)
             logging.info(f"Setting PAL value to {pal_value} for {input_path.name}")
+            # pick bind for this exact input file (keyed by resolved path)
+            bind_i = binds.get(str(input_path), self.bind)
 
             # Wait if not enough free cores
             while total_cores_used + pal_value > max_cores:
@@ -348,7 +350,7 @@ class OrcaJobSubmitter:
             
             elif engine.lower() == "pyscf":
                 f.write("# Start PySCF server before ORCA (external backend)\n")
-
+                f.write(f"echo 'JOB {job_name} using bind {bind}'\n")
                 # Choose python executable (optional). If not set, rely on env/modules.
                 
 
