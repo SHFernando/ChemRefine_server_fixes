@@ -49,6 +49,9 @@ class StepIO:
     output_files: list[str]
     seeds_ids: Optional[list[str]] = None
 
+    # NEW: per-input bind, keyed by input file path
+    binds: dict[str, str] = field(default_factory=dict)
+
 @dataclass
 class StepResult:
     coords: Any

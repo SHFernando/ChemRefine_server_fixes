@@ -174,7 +174,7 @@ class ChemRefiner:
 
         input_files = []
         output_files = []
-
+        binds = {}
         # --- Generate inputs with bind_i ---
         for i, xyz in enumerate(xyz_filenames):
 
@@ -204,7 +204,7 @@ class ChemRefiner:
 
             input_files.extend(inp_i)
             output_files.extend(out_i)
-
+            binds[inp_i[0]] = bind_i  # assuming one input per xyz
         # --- Assign seed IDs ---
         seed_ids = list(range(len(input_files)))
 
@@ -277,7 +277,7 @@ class ChemRefiner:
 
         input_files: list[str] = []
         output_files: list[str] = []
-
+        binds = {}
         # Create ORCA input files in step_dir (one-by-one so each gets a unique bind)
         for i, xyz in enumerate(xyz_filenames):
             bind_i = f"{bind_host}:{base_port + i}"
@@ -307,7 +307,7 @@ class ChemRefiner:
             # create_input returns lists
             input_files.extend(inp_i)
             output_files.extend(out_i)
-
+            binds[inp_i[0]] = bind_i  # assuming one input per xyz
         return step_dir, input_files, output_files
 
     def parse_and_filter_outputs(
@@ -367,20 +367,31 @@ class ChemRefiner:
     operation="OPT+SP",
     engine="dft",
     engine_cfg=None,  # EngineConfig
+    binds: dict[str, str] | None = None,
 ):
         """
-        Submits ORCA jobs for each input file in the step directory using OrcaJobSubmitter.
+        Submit ORCA jobs for a step.
+
+        Behavior
+        --------
+        - For standard DFT jobs (engine == "dft"): submit all inputs in a single batch.
+        - For external server/client engines (mlff/mlip/pyscf): submit one input at a time so
+        each SLURM script uses the correct bind for that input.
         """
+        import os
+        import logging
+
         engine = (engine or "dft").lower()
 
-        # derive settings from engine_cfg (backward compatible defaults)
         device = getattr(engine_cfg, "device", None) or "cpu"
         model_name = getattr(engine_cfg, "model_name", None)
         task_name = getattr(engine_cfg, "task_name", None)
-        bind = getattr(engine_cfg, "bind", None) or "127.0.0.1:8888"
+        default_bind = getattr(engine_cfg, "bind", None) or "127.0.0.1:8888"
         basis = getattr(engine_cfg, "basis", None)
         functional = getattr(engine_cfg, "functional", None)
-        model_path = getattr(engine_cfg, "model_path", None)  # if you add it later
+        model_path = getattr(engine_cfg, "model_path", None)
+
+        binds = binds or {}
 
         logging.info(f"Switching to working directory: {step_dir}")
         original_dir = os.getcwd()
@@ -394,17 +405,72 @@ class ChemRefiner:
                 f"using device={device}, engine={engine}, operation={operation}."
             )
 
-            # Create submitter with ALL engine-specific knobs stored on the instance
+            # -----------------------------
+            # Case 1: standard DFT (no bind)
+            # -----------------------------
+            if engine == "dft":
+                self.orca_submitter = OrcaJobSubmitter(
+                    scratch_dir=self.scratch_dir,
+                    orca_executable=self.orca_executable,
+                    device=device,
+                    bind=default_bind,  # unused for pure dft, but harmless
+                    basis=basis,
+                    functional=functional,
+                )
+                self.orca_submitter.submit_files(
+                    input_files=input_files,
+                    max_cores=max_cores,
+                    template_dir=self.template_dir,
+                    output_dir=step_dir,
+                    engine=engine,
+                    operation=operation,
+                    model_name=model_name,
+                    task_name=task_name,
+                    model_path=model_path,
+                )
+                return
+
+            # ------------------------------------------
+            # Case 2: external engines (need per-input bind)
+            # ------------------------------------------
+            if engine in {"mlff", "mlip", "pyscf"}:
+                for inp in input_files:
+                    # IMPORTANT: match how you keyed binds (full path vs basename)
+                    bind_i = binds.get(inp, default_bind)
+
+                    submitter = OrcaJobSubmitter(
+                        scratch_dir=self.scratch_dir,
+                        orca_executable=self.orca_executable,
+                        device=device,
+                        bind=bind_i,
+                        basis=basis,
+                        functional=functional,
+                    )
+
+                    submitter.submit_files(
+                        input_files=[inp],
+                        max_cores=max_cores,
+                        template_dir=self.template_dir,
+                        output_dir=step_dir,
+                        engine=engine,
+                        operation=operation,
+                        model_name=model_name,
+                        task_name=task_name,
+                        model_path=model_path,
+                    )
+                return
+
+            # ------------------------------------------
+            # Fallback: treat unknown engines like batch
+            # ------------------------------------------
             self.orca_submitter = OrcaJobSubmitter(
                 scratch_dir=self.scratch_dir,
                 orca_executable=self.orca_executable,
                 device=device,
-                bind=bind,
+                bind=default_bind,
                 basis=basis,
                 functional=functional,
             )
-
-            # Keep submit_files signature minimal; it uses self.device/self.bind/...
             self.orca_submitter.submit_files(
                 input_files=input_files,
                 max_cores=max_cores,
@@ -1385,7 +1451,7 @@ class ChemRefiner:
         if ctx.step_number == 1:
             initial_xyz = self.config.get("initial_xyz", None)
 
-            step_dir, input_files, output_files, seeds_ids = self.prepare_step1_directory(
+            step_dir, input_files, output_files, seeds_ids,binds = self.prepare_step1_directory(
                 step_number=ctx.step_number,
                 initial_xyz=initial_xyz,
                 charge=ctx.charge,
@@ -1411,11 +1477,12 @@ class ChemRefiner:
                 input_files=input_files,
                 output_files=output_files,
                 seeds_ids=seeds_ids,
+                binds=binds,
             )
 
         validate_structure_ids_or_raise(state.last_ids, ctx.step_number)
 
-        step_dir, input_files, output_files = self.prepare_subsequent_step_directory(
+        step_dir, input_files, output_files,binds = self.prepare_subsequent_step_directory(
             step_number=ctx.step_number,
             filtered_coordinates=state.last_coords,
             filtered_ids=state.last_ids,
@@ -1436,7 +1503,7 @@ class ChemRefiner:
             engine_extras=cfg.extras,
         )
 
-        return StepIO(step_dir=step_dir, input_files=input_files, output_files=output_files)
+        return StepIO(step_dir=step_dir, input_files=input_files, output_files=output_files, binds=binds)
 
     def _resolve_ids_and_filter(
     self,
