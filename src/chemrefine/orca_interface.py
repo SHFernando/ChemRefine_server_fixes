@@ -343,7 +343,7 @@ class OrcaJobSubmitter:
 
                 f.write("SERVER_PID=$!\n")
                 f.write("trap 'kill $SERVER_PID 2>/dev/null' EXIT\n")
-                f.write("sleep 10\n")
+                f.write("sleep 30\n")
                 f.write(
                     f"$ORCA_EXEC {input_file.name} > $OUTPUT_DIR/{job_name}.out || {{ echo 'Error: ORCA execution failed.'; kill $SERVER_PID; exit 1; }}\n"
                 )
