@@ -1,15 +1,35 @@
+from __future__ import annotations
+
 import os
-import yaml
+import sys
+import glob
+import shutil
 import logging
+from typing import Any, Optional, Tuple
+import json
+import socket
+from pathlib import Path
+import yaml
+import fcntl
 from .parse import ArgumentParser
 from .refine import StructureRefiner
 from .utils import Utility
+
 from .orca_interface import OrcaInterface, OrcaJobSubmitter
-import shutil
-import sys
-import glob
 from .mlff import MLFFTrainer
-from chemrefine.utils import (
+
+# Types (NEW)
+from .types import (
+    EngineConfig,
+    SamplingConfig,
+    StepContext,
+    StepResult,
+    PipelineState,
+    StepIO,
+)
+
+# Utility functions (make these relative, not chemrefine.utils)
+from .utils import (
     update_step_manifest_outputs,
     map_outputs_to_ids,
     write_step_manifest,
@@ -17,7 +37,9 @@ from chemrefine.utils import (
     resolve_persistent_ids,
     smiles_to_xyz,
 )
-from chemrefine.cache_utils import (
+
+# Cache utilities (relative import)
+from .cache_utils import (
     CACHE_VERSION,
     StepCache,
     save_step_cache,
@@ -56,7 +78,7 @@ class ChemRefiner:
         )
         self.scratch_dir = self.config.get("scratch_dir", "./scratch")
         self.orca_executable = self.config.get("orca_executable", "orca")
-
+        self._bind_counter = 0
         # === Setup output directory ===
         output_dir_raw = self.config.get("output_dir", "./outputs")
         self.output_dir = os.path.abspath(output_dir_raw)
@@ -74,22 +96,24 @@ class ChemRefiner:
         self.next_id = 1  # 0 will be the initial seed; next fresh ID starts at 1
 
     def prepare_step1_directory(
-        self,
-        step_number,
-        initial_xyz=None,
-        charge=None,
-        multiplicity=None,
-        operation="OPT+SP",
-        engine="dft",
-        model_name=None,
-        task_name=None,
-        device="cpu",
-        bind="127.0.0.1:8888",
-    ):
+    self,
+    step_number,
+    initial_xyz=None,
+    charge=None,
+    multiplicity=None,
+    operation="OPT+SP",
+    engine="dft",
+    model_name=None,
+    task_name=None,
+    device="cpu",
+    bind="127.0.0.1:8888",
+    basis=None,
+    functional=None,
+    engine_extras=None,
+):
         """
-        Prepare the directory for the first step by copying one or more initial XYZ files,
-        or generating XYZ files from a CSV of SMILES strings. Produces input/output files
-        and assigns seed IDs (one per XYZ).
+        Prepare step1 directory. For ML engines, assign a unique bind per initial structure.
+        Returns (step_dir, input_files, output_files, seed_ids, binds).
         """
         if charge is None:
             charge = self.charge
@@ -99,97 +123,97 @@ class ChemRefiner:
         step_dir = os.path.join(self.output_dir, f"step{step_number}")
         os.makedirs(step_dir, exist_ok=True)
 
-        # --- Discover/generate initial xyz files ---
-        if initial_xyz is None:
-            # Default: look for "step1.xyz" in template_dir
-            src_xyz_files = [os.path.join(self.template_dir, "step1.xyz")]
+        eng = (engine or "dft").lower()
+        extras = engine_extras or {}
 
+        # discover initial xyz files (your existing logic)
+        if initial_xyz is None:
+            src_xyz_files = [os.path.join(self.template_dir, "step1.xyz")]
         elif os.path.isdir(initial_xyz):
-            # User provided a directory → take all *.xyz inside
             src_xyz_files = sorted(
-                f
-                for f in glob.glob(os.path.join(initial_xyz, "*.xyz"))
-                if os.path.isfile(f)
+                f for f in glob.glob(os.path.join(initial_xyz, "*.xyz")) if os.path.isfile(f)
             )
             if not src_xyz_files:
-                raise FileNotFoundError(
-                    f"No .xyz files found in directory '{initial_xyz}'."
-                )
-
+                raise FileNotFoundError(f"No .xyz files found in directory '{initial_xyz}'.")
         elif initial_xyz.endswith(".csv"):
-            # User provided a CSV with SMILES strings → convert them into XYZs
             src_xyz_files = smiles_to_xyz(initial_xyz, step_dir)
             if not src_xyz_files:
                 raise ValueError(f"No SMILES could be converted from '{initial_xyz}'.")
-
         else:
-            # User provided a single XYZ file
             src_xyz_files = [initial_xyz]
 
-        # --- Copy/normalize names into step_dir ---
         xyz_filenames = []
         for idx, src in enumerate(src_xyz_files):
             if not os.path.exists(src):
                 raise FileNotFoundError(f"Initial XYZ file '{src}' not found.")
             dst = os.path.join(step_dir, f"step{step_number}_structure_{idx}.xyz")
-            if src != dst:  # avoid redundant copy
+            if src != dst:
                 shutil.copyfile(src, dst)
             xyz_filenames.append(dst)
 
-        # --- Input template ---
         template_inp = os.path.join(self.template_dir, "step1.inp")
         if not os.path.exists(template_inp):
-            raise FileNotFoundError(
-                f"Input file '{template_inp}' not found. Please ensure it exists."
+            raise FileNotFoundError(f"Input file '{template_inp}' not found.")
+
+        input_files: list[str] = []
+        output_files: list[str] = []
+        binds: dict[str, str] = {}
+
+        needs_bind = eng in {"mlff", "mlip", "pyscf"}
+
+        for i, xyz in enumerate(xyz_filenames):
+            bind_i = self._increment_bind(bind, i) if needs_bind else bind
+
+            inp_i, out_i = self.orca.create_input(
+                [xyz],
+                template_inp,
+                charge,
+                multiplicity,
+                output_dir=step_dir,
+                operation=operation,
+                engine=eng,
+                model_name=model_name,
+                task_name=task_name,
+                device=device,
+                bind=bind_i,
+                basis=basis,
+                xc=(functional or extras.get("xc") or extras.get("functional")),
+                df=bool(extras.get("df", False)),
+                gpu=extras.get("gpu", None),
+                pyscf_method=extras.get("method", "dft"),
+                pyscf_prog=extras.get("prog", None),
             )
 
-        # --- Generate inputs/outputs ---
-        input_files, output_files = self.orca.create_input(
-            xyz_filenames,
-            template_inp,
-            charge,
-            multiplicity,
-            output_dir=step_dir,
-            operation=operation,
-            engine=engine,
-            model_name=model_name,
-            task_name=task_name,
-            device=device,
-            bind=bind,
-        )
+            input_files.extend(inp_i)
+            output_files.extend(out_i)
+            binds[str(Path(inp_i[0]).resolve())] = bind_i
 
-        # --- Assign seed IDs (one per input structure) ---
         seed_ids = list(range(len(input_files)))
-
-        return step_dir, input_files, output_files, seed_ids
+        return step_dir, input_files, output_files, seed_ids, binds
 
     def prepare_subsequent_step_directory(
-        self,
-        step_number,
-        filtered_coordinates,
-        filtered_ids,
-        charge=None,
-        multiplicity=None,
-        operation="OPT+SP",
-        engine="dft",
-        model_name=None,
-        task_name=None,
-        device="cuda",
-        bind="127.0.0.1:8888",
-    ):
+    self,
+    step_number,
+    filtered_coordinates,
+    filtered_ids,
+    charge=None,
+    multiplicity=None,
+    operation="OPT+SP",
+    engine="dft",
+    model_name=None,
+    task_name=None,
+    device="cuda",
+    bind="127.0.0.1:8888",
+    basis=None,
+    functional=None,
+    engine_extras=None,
+):
         """
-        Prepares the directory for subsequent steps by writing XYZ files, copying the template input,
-        and generating ORCA input files.
+        Prepare a subsequent step directory and generate ORCA inputs/outputs.
 
-        Args:
-            step_number (int): The current step number.
-            filtered_coordinates (list): Filtered coordinates from the previous step.
-            filtered_ids (list): Filtered IDs from the previous step.
-
-        Returns:
-            step_dir (str): Path to the step directory.
-            input_files (list): List of generated ORCA input files.
-            output_files (list): List of expected ORCA output files.
+        For MLFF/MLIP/PySCF engines, assigns a unique bind per input structure by
+        incrementing the base port (bind) by the structure index, and returns a
+        mapping from resolved input file path -> bind.
         """
         if charge is None:
             charge = self.charge
@@ -199,40 +223,58 @@ class ChemRefiner:
         step_dir = os.path.join(self.output_dir, f"step{step_number}")
         os.makedirs(step_dir, exist_ok=True)
 
-        # Write XYZ files in step_dir
+        eng = (engine or "dft").lower()
+        extras = engine_extras or {}
+
         xyz_filenames = self.utils.write_xyz(
             filtered_coordinates, step_number, filtered_ids, output_dir=step_dir
         )
 
-        # Copy the template input file from template_dir to step_dir
         input_template_src = os.path.join(self.template_dir, f"step{step_number}.inp")
         input_template_dst = os.path.join(step_dir, f"step{step_number}.inp")
         if not os.path.exists(input_template_src):
-            logging.warning(
-                f"Input file '{input_template_src}' not found. Exiting pipeline."
-            )
-            sys.exit(1)
             raise FileNotFoundError(
-                f"Input file '{input_template_src}' not found. Please ensure that 'step{step_number}.inp' exists in the template directory."
+                f"Input file '{input_template_src}' not found. Please ensure it exists."
             )
         shutil.copyfile(input_template_src, input_template_dst)
 
-        # Create ORCA input files in step_dir
-        input_files, output_files = self.orca.create_input(
-            xyz_filenames,
-            input_template_dst,
-            charge,
-            multiplicity,
-            output_dir=step_dir,
-            operation=operation,
-            engine=engine,
-            model_name=model_name,
-            task_name=task_name,
-            device=device,
-            bind=bind,
-        )
+        input_files: list[str] = []
+        output_files: list[str] = []
+        binds: dict[str, str] = {}
 
-        return step_dir, input_files, output_files
+        # Only engines that use server/client need per-input binds
+        needs_bind = eng in {"mlff", "mlip", "pyscf"}
+
+        for i, xyz in enumerate(xyz_filenames):
+            bind_i = self._increment_bind(bind, i) if needs_bind else bind
+
+            inp_i, out_i = self.orca.create_input(
+                [xyz],
+                input_template_dst,
+                charge,
+                multiplicity,
+                output_dir=step_dir,
+                operation=operation,
+                engine=eng,
+                model_name=model_name,
+                task_name=task_name,
+                device=device,
+                bind=bind_i,
+                basis=basis,
+                xc=(functional or extras.get("xc") or extras.get("functional")),
+                df=bool(extras.get("df", False)),
+                gpu=extras.get("gpu", None),
+                pyscf_method=extras.get("method", "dft"),
+                pyscf_prog=extras.get("prog", None),
+            )
+
+            input_files.extend(inp_i)
+            output_files.extend(out_i)
+
+            # Key by resolved input path so submitter can look it up reliably
+            binds[str(Path(inp_i[0]).resolve())] = bind_i
+
+        return step_dir, input_files, output_files, binds
 
     def parse_and_filter_outputs(
         self,
@@ -283,40 +325,49 @@ class ChemRefiner:
         return filtered_coordinates, selected_ids
 
     def submit_orca_jobs(
-        self,
-        input_files,
-        max_cores,
-        step_dir,
-        device="cpu",
-        operation="OPT+SP",
-        engine="DFT",
-        model_name=None,
-        task_name=None,
-    ):
+    self,
+    *,
+    input_files,
+    max_cores,
+    step_dir,
+    operation="OPT+SP",
+    engine="dft",
+    engine_cfg=None,
+    binds: dict[str, str] | None = None,
+):
         """
-        Submits ORCA jobs for each input file in the step directory using the OrcaJobSubmitter.
+        Submit ORCA jobs for a step.
 
-        Args:
-            input_files (list): List of ORCA input files.
-            cores (int): Maximum total cores allowed for all jobs.
-            step_dir (str): Path to the step directory.
+        - DFT: batch submit as usual.
+        - MLFF/MLIP/PySCF: batch submit, but per-input binds are used when writing SLURM scripts.
         """
+        engine = (engine or "dft").lower()
+
+        device = getattr(engine_cfg, "device", None) or "cpu"
+        model_name = getattr(engine_cfg, "model_name", None)
+        task_name = getattr(engine_cfg, "task_name", None)
+        default_bind = getattr(engine_cfg, "bind", None) or "127.0.0.1:8888"
+        basis = getattr(engine_cfg, "basis", None)
+        functional = getattr(engine_cfg, "functional", None)
+        model_path = getattr(engine_cfg, "model_path", None)
+
+        binds = binds or {}
+
         logging.info(f"Switching to working directory: {step_dir}")
         original_dir = os.getcwd()
         os.chdir(step_dir)
-        logging.info(f"Current working directory: {os.getcwd()}")
-        logging.info(
-            f"Running in {self.scratch_dir} from submit_orca_jobs helper function."
-        )
+
         try:
-            logging.info(
-                f"Submitting ORCA jobs in {step_dir} with {len(input_files)} input files using {device}."
-            )
             self.orca_submitter = OrcaJobSubmitter(
                 scratch_dir=self.scratch_dir,
                 orca_executable=self.orca_executable,
                 device=device,
+                bind=default_bind,  # fallback only
+                basis=basis,
+                functional=functional,
             )
+
+            # IMPORTANT: submit in one batch and DO NOT WAIT
             self.orca_submitter.submit_files(
                 input_files=input_files,
                 max_cores=max_cores,
@@ -326,13 +377,12 @@ class ChemRefiner:
                 operation=operation,
                 model_name=model_name,
                 task_name=task_name,
+                model_path=model_path,
+                binds=binds,     # <-- NEW
             )
-        except Exception as e:
-            logging.error(f"Error while submitting ORCA jobs in {step_dir}: {str(e)}")
-            raise
+
         finally:
             os.chdir(original_dir)
-            logging.info(f"Returned to original directory: {original_dir}")
 
     def run_mlff_train(
         self, step_number, step, last_coords, last_ids, last_energies, last_forces
@@ -1099,413 +1149,495 @@ class ChemRefiner:
             f"[rebuild_nms] Done. You can now run with --skip to continue from step {step_number + 1}."
         )
 
-    ###____RUN____###
+    def _handle_rebuild_modes(self, args) -> bool:
+        """Return True if we handled a rebuild mode and exited early."""
+        if getattr(args, "rebuild_cache", False):
+            target = args.rebuild_cache if isinstance(args.rebuild_cache, int) else None
+            if target is not None:
+                self.rebuild_target_step = target
+            self.rebuild_step_cache_and_exit()
+            return True
 
-    def run(self):
-        """
-        Main pipeline execution function for ChemRefine.
+        if getattr(args, "rebuild_nms", False):
+            target = args.rebuild_nms if isinstance(args.rebuild_nms, int) else None
+            if target is not None:
+                self.rebuild_target_step = target
+            self.rebuild_nms_cache_and_exit()
+            return True
 
-        """
-        # --- Handle rebuild modes early ---
+        if getattr(args, "rerun_errors", False):
+            target = args.rerun_errors if isinstance(args.rerun_errors, int) else None
+            if target is not None:
+                self.rebuild_target_step = target
+            self.rerun_errors(target_step=target)
+            return True
+
+        return False
+   
+    def _build_step_context(self, step: dict) -> StepContext:
+        step_number = step["step"]
+        operation = step["operation"].upper()
+        engine = step.get("engine", "dft").lower()
+
+        engine_cfg = self._extract_engine_config(step, engine)
+        sampling = self._extract_sampling(step)
+
+        charge = step.get("charge", self.charge)
+        multiplicity = step.get("multiplicity", self.multiplicity)
+
+        return StepContext(
+            step_number=step_number,
+            operation=operation,
+            engine=engine,
+            charge=charge,
+            multiplicity=multiplicity,
+            engine_cfg=engine_cfg,
+            sampling=sampling,
+            step=step,
+        )
+
+    def _validate_step_context(self, ctx: StepContext) -> None:
+        valid_operations = {
+            "OPT+SP", "GOAT", "PES", "DOCKER", "SOLVATOR", "MLFF_TRAIN", "MLIP_TRAIN"
+        }
+        valid_engines = {"dft", "mlff", "mlip", "pyscf"}
+
+        if ctx.operation not in valid_operations:
+            raise ValueError(
+                f"Invalid operation '{ctx.operation}' at step {ctx.step_number}. "
+                f"Must be one of {valid_operations}."
+            )
+        if ctx.engine not in valid_engines:
+            raise ValueError(
+                f"Invalid engine '{ctx.engine}' at step {ctx.step_number}. "
+                f"Must be one of {valid_engines}."
+            )
+        if ctx.engine == "pyscf":
+            if not ctx.engine_cfg.basis:
+                raise ValueError(f"[step {ctx.step_number}] pyscf engine requires 'pyscf: basis'.")
+            if not ctx.engine_cfg.functional:
+                raise ValueError(f"[step {ctx.step_number}] pyscf engine requires 'pyscf: functional' (or 'xc').")
+            if ctx.engine_cfg.device not in {"cpu", "cuda"}:
+                raise ValueError(f"[step {ctx.step_number}] pyscf device must be 'cpu' or 'cuda'.")
+            ###____RUN____###
+
+    def _extract_engine_config(self, step: dict, engine: str) -> EngineConfig:
+        engine = engine.lower()
+
+        # --- defaults shared across engines ---
+        default_bind = "127.0.0.1:8888"
+
+        # ----------------
+        # MLFF / MLIP
+        # ----------------
+        if engine in {"mlff", "mlip"}:
+            cfg = step.get(engine, {}) or {}
+            return EngineConfig(
+                engine=engine,
+                model_name=cfg.get("model_name", "medium"),
+                task_name=cfg.get("task_name", "mace_off"),
+                bind=cfg.get("bind", default_bind),
+                device=cfg.get("device", "cuda"),
+                extras=dict(cfg),
+            )
+
+        # ----------------
+        # PySCF (ORCA optimizer + PySCF backend)
+        # ----------------
+        if engine == "pyscf":
+            cfg = step.get("pyscf", {}) or {}
+
+            # allow either gpu: true/false or device: cuda/cpu
+            device = cfg.get("device")
+            if device is None:
+                device = "cuda" if cfg.get("gpu", False) else "cpu"
+
+            return EngineConfig(
+                engine="pyscf",
+                device=device,
+                bind=cfg.get("bind", default_bind),
+                basis=cfg.get("basis", step.get("basis")),               # allow top-level fallback if you want
+                functional=cfg.get("functional", cfg.get("xc", "pbe")),   # support xc alias; default pbe
+                extras=dict(cfg),
+            )
+
+        # ----------------
+        # Plain DFT (ORCA)
+        # ----------------
+        return EngineConfig(engine=engine, bind=default_bind, device="cpu")
+
+    def _extract_sampling(self, step: dict) -> SamplingConfig:
+        st = step.get("sample_type")
+        method = st.get("method") if st else None
+        params = st.get("parameters", {}) if st else {}
+        return SamplingConfig(method=method, parameters=params)
+
+    def _try_restore_from_step_cache(self, step_dir: str, fp_now: str, ctx: StepContext) -> Optional[StepResult]:
+        if not self.skip_steps:
+            return None
+
+        cached = load_step_cache(step_dir)
+        if not cached:
+            logging.info(f"[step {ctx.step_number}] No step-level cache; computing.")
+            return None
+
+        # NOTE: your original code has a weird nested `if cached: else: if cached:` branch.
+        # Here we assume load_step_cache already returns None on mismatch OR you can check here.
+        # If you want strict checking, do it here using cached.fingerprint, cached.operation, cached.engine, etc.
+
+        logging.info(f"[step {ctx.step_number}] Step-level cache hit: {len(cached.ids)} items restored.")
+        return StepResult(
+            coords=cached.coords,
+            ids=cached.ids,
+            energies=cached.energies,
+            forces=cached.forces,
+            output_files=[],  # not stored in your StepCache (unless you add it)
+        )
+
+    def _execute_step_heavy_work(
+    self,
+    ctx: StepContext,
+    state: PipelineState,
+    step_dir: str,
+    fp_now: str,
+) -> StepResult:
+        io = self._prepare_step_io(ctx, state)
+        write_step_manifest(ctx.step_number, io.step_dir, io.input_files, ctx.operation, ctx.engine)
+
+        self.submit_orca_jobs(
+            input_files=io.input_files,
+            max_cores=self.max_cores,
+            step_dir=io.step_dir,
+            operation=ctx.operation,
+            engine=ctx.engine,
+            engine_cfg=ctx.engine_cfg,  
+            binds=io.binds, 
+        )
+
+
+        coords, energies, forces = self.orca.parse_output(io.output_files, ctx.operation, dir=io.step_dir)
+        update_step_manifest_outputs(io.step_dir, ctx.step_number, io.output_files)
+
+        coords, ids, energies, forces = self._resolve_ids_and_filter(
+            ctx=ctx,
+            state=state,
+            step_dir=io.step_dir,
+            output_files=io.output_files,
+            coords=coords,
+            energies=energies,
+            forces=forces,
+        )
+
+        if coords is None or ids is None:
+            logging.error(f"Filtering failed at step {ctx.step_number}. Exiting pipeline.")
+            raise RuntimeError(f"Filtering failed at step {ctx.step_number}")
+
+        self._write_step_cache(ctx, step_dir, fp_now, state.last_ids, coords, ids, energies, forces)
+
+        return StepResult(coords=coords, ids=ids, energies=energies, forces=forces, output_files=io.output_files)
+
+    def _prepare_step_io(self, ctx: StepContext, state: PipelineState) -> StepIO:
+        cfg = ctx.engine_cfg or EngineConfig()
+
+        base_bind = getattr(cfg, "bind", None) or "127.0.0.1:8888"
+        cfg.bind = self._increment_bind(base_bind)
+        ctx.engine_cfg = cfg
+
+        if ctx.step_number == 1:
+            initial_xyz = self.config.get("initial_xyz", None)
+
+            step_dir, input_files, output_files, seeds_ids,binds = self.prepare_step1_directory(
+                step_number=ctx.step_number,
+                initial_xyz=initial_xyz,
+                charge=ctx.charge,
+                multiplicity=ctx.multiplicity,
+                operation=ctx.operation,
+                engine=ctx.engine,
+
+                # unified engine config threading
+                model_name=cfg.model_name,
+                task_name=cfg.task_name,
+                device=cfg.device,
+                bind=cfg.bind,
+
+                # pyscf-specific (safe for others; they can ignore)
+                basis=cfg.basis,
+                functional=cfg.functional,
+                engine_extras=cfg.extras,
+            )
+
+            state.last_ids = seeds_ids
+            return StepIO(
+                step_dir=step_dir,
+                input_files=input_files,
+                output_files=output_files,
+                seeds_ids=seeds_ids,
+                binds=binds,
+            )
+
+        validate_structure_ids_or_raise(state.last_ids, ctx.step_number)
+
+        step_dir, input_files, output_files,binds = self.prepare_subsequent_step_directory(
+            step_number=ctx.step_number,
+            filtered_coordinates=state.last_coords,
+            filtered_ids=state.last_ids,
+            charge=ctx.charge,
+            multiplicity=ctx.multiplicity,
+            operation=ctx.operation,
+            engine=ctx.engine,
+
+            # unified engine config threading
+            model_name=cfg.model_name,
+            task_name=cfg.task_name,
+            device=cfg.device,
+            bind=cfg.bind,
+
+            # pyscf-specific
+            basis=cfg.basis,
+            functional=cfg.functional,
+            engine_extras=cfg.extras,
+        )
+
+        return StepIO(step_dir=step_dir, input_files=input_files, output_files=output_files, binds=binds)
+
+    def _resolve_ids_and_filter(
+    self,
+    *,
+    ctx: StepContext,
+    state: PipelineState,
+    step_dir: str,
+    output_files: list[str],
+    coords,
+    energies,
+    forces,
+):
+        last_ids = state.last_ids
+
+        ensemble_ops = {"GOAT", "PES", "DOCKER", "SOLVATOR"}
+        needs_per_parent = (
+            ctx.operation in ensemble_ops
+            or (ctx.step_number == 1 and last_ids is not None and len(last_ids) > 1)
+        )
+
+        if needs_per_parent:
+            result = self.process_step_with_parent_allocation(
+                ctx.step_number,
+                ctx.operation,
+                step_dir,
+                output_files,
+                last_ids,
+                ctx.sampling.method,
+                ctx.sampling.parameters,
+            )
+            if isinstance(result, tuple) and len(result) == 5:
+                coords, ids, energies, forces, _by_parent = result
+            else:
+                coords, ids, energies, forces = result
+            return coords, ids, energies, forces
+
+        # 1:1 OPT+SP propagation
+        if (ctx.step_number != 1) and (len(last_ids) == len(output_files)) and (ctx.operation in {"OPT+SP"}):
+            logging.info(f"[step {ctx.step_number}] 1:1 propagation detected, reusing parent IDs.")
+            ids = last_ids[:]
+        else:
+            num_out = len(coords)
+            ids, self.next_id = resolve_persistent_ids(
+                step_number=ctx.step_number,
+                last_ids=last_ids,
+                coords_count=num_out,
+                output_files=output_files,
+                operation=ctx.operation,
+                next_id=self.next_id,
+                file_map_fn=map_outputs_to_ids,
+                step_dir=step_dir,
+            )
+
+        coords, ids = self.refiner.filter(
+            coords,
+            energies,
+            ids,
+            ctx.sampling.method,
+            ctx.sampling.parameters,
+            by_parent=False,
+        )
+        return coords, ids, energies, forces
+
+    def _write_step_cache(self, ctx: StepContext, step_dir: str, fp_now, parent_ids, coords, ids, energies, forces) -> None:
+        try:
+            step_cache = StepCache(
+                version=CACHE_VERSION,
+                step=ctx.step_number,
+                operation=ctx.operation,
+                engine=ctx.engine,
+                fingerprint=fp_now,
+                parent_ids=(parent_ids if ctx.step_number > 1 else None),
+                ids=ids,
+                n_outputs=len(ids),
+                by_parent=None,
+                coords=coords,
+                energies=energies,
+                forces=forces,
+                extras=None,
+            )
+            save_step_cache(step_dir, step_cache)
+            logging.info(f"[step {ctx.step_number}] Wrote step cache ({len(ids)} items).")
+        except Exception as e:
+            logging.warning(f"[step {ctx.step_number}] Cache write failed: {e}")
+
+    def _maybe_run_normal_mode_sampling(self, ctx: StepContext, step_dir: str, result: StepResult) -> StepResult:
+        if not ctx.step.get("normal_mode_sampling", False):
+            return result
+
+        nms_params = ctx.step.get("normal_mode_sampling_parameters", {})
+        calc_type = nms_params.get("calc_type", "rm_imag")
+        displacement_vector = nms_params.get("displacement_vector", 1.0)
+        nms_random_displacements = nms_params.get("num_random_displacements", 1)
+
+        output_files = result.output_files or [
+            os.path.join(step_dir, f)
+            for f in os.listdir(step_dir)
+            if f.endswith(".out") and not f.startswith("slurm")
+        ]
+        if not output_files:
+            logging.warning(f"No valid .out files found for normal mode sampling in step {ctx.step_number}. Skipping NMS.")
+            return result
+
+        logging.info(f"Normal mode sampling requested for step {ctx.step_number}.")
+        input_template_path = os.path.join(self.template_dir, f"step{ctx.step_number}.inp")
+
+        cfg = ctx.engine_cfg  # EngineConfig
+
+        coords, ids = self.orca.normal_mode_sampling(
+            file_paths=output_files,
+            calc_type=calc_type,
+            input_template=input_template_path,
+            slurm_template=self.template_dir,
+            charge=ctx.charge,
+            multiplicity=ctx.multiplicity,
+            output_dir=self.output_dir,
+            operation=ctx.operation,
+            engine=ctx.engine,
+
+            # --- MLFF/MLIP/PySCF config comes from engine_cfg ---
+            model_name=cfg.model_name,
+            step_number=ctx.step_number,
+            structure_ids=result.ids,
+            max_cores=self.max_cores,
+            task_name=cfg.task_name,
+            mlff_model=cfg.model_name,          # keep if your API expects a separate field; otherwise drop
+            displacement_value=displacement_vector,
+            device=cfg.device,
+            bind=cfg.bind,
+
+            # --- ORCA execution ---
+            orca_executable=self.orca_executable,
+            scratch_dir=self.scratch_dir,
+            num_random_modes=nms_random_displacements,
+        )
+
+        # (Optional) refresh cache after NMS like you do now
+        try:
+            step_cache = StepCache(
+                version=CACHE_VERSION,
+                step=ctx.step_number,
+                operation=ctx.operation,
+                engine=ctx.engine,
+                fingerprint=None,  # disables matching
+                parent_ids=None,
+                ids=ids,
+                n_outputs=len(ids),
+                by_parent=None,
+                coords=coords,
+                energies=[None] * len(ids),
+                forces=[None] * len(ids),
+                extras={"nms_generation": True},
+            )
+            save_step_cache(step_dir, step_cache)
+            logging.info(f"[step {ctx.step_number}] Updated step cache after NMS ({len(ids)} items).")
+        except Exception as e:
+            logging.warning(f"[step {ctx.step_number}] Cache write (post-NMS) failed: {e}")
+
+        return StepResult(coords=coords, ids=ids, energies=result.energies, forces=result.forces, output_files=output_files)
+
+    def _commit_step(self, ctx: StepContext, result: StepResult, state: PipelineState) -> None:
+        state.last_coords, state.last_ids = result.coords, result.ids
+        state.last_energies, state.last_forces = result.energies, result.forces
+
+        print(f"Step {ctx.step_number} completed: {len(state.last_coords)} structures ready.")
+        print(f"Your ID's for this step are: {state.last_ids}")
+
+    def _maybe_export_step_csv(self, ctx: StepContext, state: PipelineState) -> None:
+        if state.last_energies is not None and len(state.last_energies) == len(state.last_ids):
+            self.utils.save_step_csv(
+                energies=state.last_energies,
+                ids=state.last_ids,
+                step=ctx.step_number,
+                output_dir=self.output_dir,
+            )
+        else:
+            logging.info(f"[step {ctx.step_number}] Skipping CSV export (energy/ID mismatch or missing energies).")
+
+    def _parse_bind(self, bind: str) -> tuple[str, int]:
+        """Parse 'host:port' into (host, port)."""
+        host, port_s = bind.split(":")
+        return host.strip(), int(port_s)
+
+    def _format_bind(self, host: str, port: int) -> str:
+        """Format (host, port) into 'host:port'."""
+        return f"{host}:{port}"
+
+    def _increment_bind(self, bind: str, delta=1) -> str:
+        """Return bind with port increased by delta."""
+        host, port = self._parse_bind(bind)
+        return self._format_bind(host, port + int(delta))
+
+    def run(self) -> None:
+        """Main pipeline execution function for ChemRefine."""
         args = getattr(self, "args", None)
-
-        if args is not None:
-            # Handle --rebuild_cache (optionally with step number)
-            if getattr(args, "rebuild_cache", False):
-                target = (
-                    args.rebuild_cache if isinstance(args.rebuild_cache, int) else None
-                )
-                if target is not None:
-                    self.rebuild_target_step = target
-                self.rebuild_step_cache_and_exit()
-                return
-
-            # Handle --rebuild_nms (optionally with step number)
-            if getattr(args, "rebuild_nms", False):
-                target = args.rebuild_nms if isinstance(args.rebuild_nms, int) else None
-                if target is not None:
-                    self.rebuild_target_step = target
-                self.rebuild_nms_cache_and_exit()
-                return
-
-            if getattr(args, "rerun_errors", False):
-                target = (
-                    args.rerun_errors if isinstance(args.rerun_errors, int) else None
-                )
-                if target is not None:
-                    self.rebuild_target_step = target
-                self.rerun_errors(target_step=target)
-                return
+        if args is not None and self._handle_rebuild_modes(args):
+            return
 
         logging.info("Starting ChemRefine pipeline.")
+        state = PipelineState()
 
-        # Results from the last completed (or skipped) step; used by MLFF_TRAIN.
-        last_coords = None
-        last_ids = None
-        last_energies = None
-        last_forces = None
-
-        valid_operations = {
-            "OPT+SP",
-            "GOAT",
-            "PES",
-            "DOCKER",
-            "SOLVATOR",
-            "MLFF_TRAIN",
-            "MLIP_TRAIN",
-        }
-        valid_engines = {"dft", "mlff", "mlip"}
-
-        steps = self.config.get("steps", [])
-
-        for step in steps:
-            step_number = step["step"]
-            operation = step["operation"].upper()
-            engine = step.get("engine", "dft").lower()
-
+        for step in self.config.get("steps", []):
+            ctx = self._build_step_context(step)
+            self._validate_step_context(ctx)
             logging.info(
-                f"Processing step {step_number}: operation '{operation}', engine '{engine}'."
+                f"Processing step {ctx.step_number}: operation '{ctx.operation}', engine '{ctx.engine}'."
             )
 
-            if operation not in valid_operations:
-                raise ValueError(
-                    f"Invalid operation '{operation}' at step {step_number}. "
-                    f"Must be one of {valid_operations}."
-                )
-            if engine not in valid_engines:
-                raise ValueError(
-                    f"Invalid engine '{engine}' at step {step_number}. "
-                    f"Must be one of {valid_engines}."
-                )
-
-            # MLFF/MLIP config
-            if engine in {"mlff", "mlip"}:
-                ml_config = step.get(engine, {})
-                model = ml_config.get("model_name", "medium")
-                task = ml_config.get("task_name", "mace_off")
-                bind_address = ml_config.get("bind", "127.0.0.1:8888")
-                device = ml_config.get("device", "cuda")
-
-                logging.info(
-                    f"Using {engine.upper()} model '{model}' with task '{task}' for step {step_number}."
-                )
-            else:
-                model = None
-                task = None
-                bind_address = None
-                device = None
-
-            # Sampling (optional)
-            st = step.get("sample_type")
-            sample_method = st.get("method") if st else None
-            parameters = st.get("parameters", {}) if st else {}
-
-            # === Training-only steps ===
-            if operation in {"MLFF_TRAIN", "MLIP_TRAIN"}:
-                self.run_mlff_train(
-                    step_number, step, last_coords, last_ids, last_energies, last_forces
-                )
+            # Training-only steps
+            if ctx.operation in {"MLFF_TRAIN", "MLIP_TRAIN"}:
+                self._run_training_step(ctx, state)
                 continue
 
-            # === Non-training steps ===
-            charge = step.get("charge", self.charge)
-            multiplicity = step.get("multiplicity", self.multiplicity)
-
-            filtered_coordinates = None
-            filtered_ids = None
-            energies = None
-            forces = None
-
             # Paths & fingerprint
-            step_dir = os.path.join(self.output_dir, f"step{step_number}")
+            step_dir = os.path.join(self.output_dir, f"step{ctx.step_number}")
             os.makedirs(os.path.join(step_dir, "_cache"), exist_ok=True)
-            parent_ids_for_fp = last_ids if step_number > 1 else None
+
+            parent_ids_for_fp = state.last_ids if ctx.step_number > 1 else None
             fp_now = build_step_fingerprint(
-                step, parent_ids_for_fp, parameters, step_number
+                ctx.step, parent_ids_for_fp, ctx.sampling.parameters, ctx.step_number
             )
 
-            # ---------- Fast skip via step-level cache ----------
-            output_files = []  # set later as needed
-            if self.skip_steps:
-                cached = load_step_cache(step_dir)
-                if cached:
-                    filtered_coordinates = cached.coords
-                    filtered_ids = cached.ids
-                    energies = cached.energies
-                    forces = cached.forces
-                    logging.info(
-                        f"[step {step_number}] Step-level cache hit: {len(filtered_ids)} items restored."
-                    )
-                else:
-                    if cached:
-                        logging.info(
-                            f"[step {step_number}] Step-level cache present but fingerprint/op/engine mismatch; recomputing."
-                        )
-                    else:
-                        logging.info(
-                            f"[step {step_number}] No step-level cache; computing."
-                        )
-
-            if filtered_coordinates is None or filtered_ids is None:
-                logging.warning(
-                    f"No valid step cache for step {step_number}. Proceeding with normal execution."
-                )
-
-                # --- Prepare inputs ---
-                if step_number == 1:
-                    initial_xyz = self.config.get("initial_xyz", None)
-                    step_dir, input_files, output_files, seeds_ids = (
-                        self.prepare_step1_directory(
-                            step_number=step_number,
-                            initial_xyz=initial_xyz,
-                            charge=charge,
-                            multiplicity=multiplicity,
-                            operation=operation,
-                            engine=engine,
-                            model_name=model,
-                            task_name=task,
-                            device=device,
-                            bind=bind_address,
-                        )
-                    )
-                    last_ids = seeds_ids
-                else:
-                    validate_structure_ids_or_raise(last_ids, step_number)
-                    step_dir, input_files, output_files = (
-                        self.prepare_subsequent_step_directory(
-                            step_number=step_number,
-                            filtered_coordinates=last_coords,
-                            filtered_ids=last_ids,
-                            charge=charge,
-                            multiplicity=multiplicity,
-                            operation=operation,
-                            engine=engine,
-                            model_name=model,
-                            task_name=task,
-                            device=device,
-                            bind=bind_address,
-                        )
-                    )
-
-                # Save manifest with input structure IDs
-                write_step_manifest(
-                    step_number, step_dir, input_files, operation, engine
-                )
-
-                # Submit jobs (ALWAYS submit all for this step in the simplified model)
-                self.submit_orca_jobs(
-                    input_files=input_files,
-                    max_cores=self.max_cores,
-                    step_dir=step_dir,
-                    operation=operation,
-                    engine=engine,
-                    model_name=model,
-                    task_name=task,
-                    device=device,
-                )
-
-                # --- Parse outputs (ALWAYS pass OUTPUT files) ---
-                filtered_coordinates, energies, forces = self.orca.parse_output(
-                    output_files, operation, dir=step_dir
-                )
-
-                # Update manifest with output files (full list for this step)
-                update_step_manifest_outputs(step_dir, step_number, output_files)
-
-                # === ID resolution ===
-                ensemble_ops = {"GOAT", "PES", "DOCKER", "SOLVATOR"}
-                needs_per_parent = operation in ensemble_ops or (
-                    step_number == 1 and last_ids is not None and len(last_ids) > 1
-                )
-
-                if needs_per_parent:
-                    # Ensemble: allocate children by parent
-                    result = self.process_step_with_parent_allocation(
-                        step_number,
-                        operation,
-                        step_dir,
-                        output_files,
-                        last_ids,
-                        sample_method,
-                        parameters,
-                    )
-                    # Backward compatibility if function returns 5-tuple (with by_parent)
-                    if isinstance(result, tuple) and len(result) == 5:
-                        (
-                            filtered_coordinates,
-                            filtered_ids,
-                            energies,
-                            forces,
-                            _by_parent,
-                        ) = result
-                    else:
-                        filtered_coordinates, filtered_ids, energies, forces = result
-                else:
-                    # 1:1 (OPT+SP) default path
-                    if (
-                        (step_number != 1)
-                        and (len(last_ids) == len(output_files))
-                        and operation in {"OPT+SP"}
-                    ):
-                        logging.info(
-                            f"[step {step_number}] 1:1 propagation detected, reusing parent IDs."
-                        )
-                        filtered_ids = last_ids[:]
-                    else:
-                        num_out = len(filtered_coordinates)
-                        filtered_ids, self.next_id = resolve_persistent_ids(
-                            step_number=step_number,
-                            last_ids=last_ids,
-                            coords_count=num_out,
-                            output_files=output_files,
-                            operation=operation,
-                            next_id=self.next_id,
-                            file_map_fn=map_outputs_to_ids,
-                            step_dir=step_dir,
-                        )
-
-                    # Filtering for non-ensemble ops
-                    filtered_coordinates, filtered_ids = self.refiner.filter(
-                        filtered_coordinates,
-                        energies,
-                        filtered_ids,
-                        sample_method,
-                        parameters,
-                        by_parent=False,
-                    )
-
-                if filtered_coordinates is None or filtered_ids is None:
-                    logging.error(
-                        f"Filtering failed at step {step_number}. Exiting pipeline."
-                    )
-                    return
-
-                # --- Write step-level cache immediately after successful processing ---
-                try:
-                    step_cache = StepCache(
-                        version=CACHE_VERSION,
-                        step=step_number,
-                        operation=operation,
-                        engine=engine,
-                        fingerprint=fp_now,
-                        parent_ids=(last_ids if step_number > 1 else None),
-                        ids=filtered_ids,
-                        n_outputs=len(filtered_ids),
-                        by_parent=None,
-                        coords=filtered_coordinates,
-                        energies=energies,
-                        forces=forces,
-                        extras=None,
-                    )
-                    save_step_cache(step_dir, step_cache)
-                    logging.info(
-                        f"[step {step_number}] Wrote step cache ({len(filtered_ids)} items)."
-                    )
-                except Exception as e:
-                    logging.warning(f"[step {step_number}] Cache write failed: {e}")
-
+            # Try cache, else do heavy work
+            restored = self._try_restore_from_step_cache(step_dir, fp_now, ctx)
+            if restored is not None:
+                result = restored
+                logging.info(f"Skipping heavy work for step {ctx.step_number} (cache restored).")
             else:
-                logging.info(
-                    f"Skipping heavy work for step {step_number} (step-level cache restored)."
-                )
+                result = self._execute_step_heavy_work(ctx, state, step_dir, fp_now)
 
-            # ---------- Optional: Normal Mode Sampling ----------
-            if step.get("normal_mode_sampling", False):
-                nms_params = step.get("normal_mode_sampling_parameters", {})
-                calc_type = nms_params.get("calc_type", "rm_imag")
-                displacement_vector = nms_params.get("displacement_vector", 1.0)
-                nms_random_displacements = nms_params.get("num_random_displacements", 1)
+            # Optional normal mode sampling
+            result = self._maybe_run_normal_mode_sampling(ctx, step_dir, result)
 
-                if not output_files:
-                    output_files = [
-                        os.path.join(step_dir, f)
-                        for f in os.listdir(step_dir)
-                        if f.endswith(".out") and not f.startswith("slurm")
-                    ]
-
-                if not output_files:
-                    logging.warning(
-                        f"No valid .out files found for normal mode sampling in step {step_number}. Skipping NMS."
-                    )
-                else:
-                    logging.info(
-                        f"Normal mode sampling requested for step {step_number}."
-                    )
-                    input_template_path = os.path.join(
-                        self.template_dir, f"step{step_number}.inp"
-                    )
-                    filtered_coordinates, filtered_ids = self.orca.normal_mode_sampling(
-                        file_paths=output_files,
-                        calc_type=calc_type,
-                        input_template=input_template_path,
-                        slurm_template=self.template_dir,
-                        charge=step.get("charge", self.charge),
-                        multiplicity=step.get("multiplicity", self.multiplicity),
-                        output_dir=self.output_dir,
-                        operation=operation,
-                        engine=engine,
-                        model_name=model,
-                        step_number=step_number,
-                        structure_ids=filtered_ids,
-                        max_cores=self.max_cores,
-                        task_name=task,
-                        mlff_model=model,
-                        displacement_value=displacement_vector,
-                        device=device,
-                        bind=bind_address,
-                        orca_executable=self.orca_executable,
-                        scratch_dir=self.scratch_dir,
-                        num_random_modes=nms_random_displacements,
-                    )
-
-                    # After NMS, refresh step-level cache to reflect the final outputs
-                    try:
-                        step_cache = StepCache(
-                            version=CACHE_VERSION,
-                            step=step_number,
-                            operation=operation,
-                            engine=engine,
-                            fingerprint=None,  # optional, to disable matching
-                            parent_ids=(last_ids if step_number > 1 else None),
-                            ids=filtered_ids,
-                            n_outputs=len(filtered_ids),
-                            by_parent=None,
-                            coords=filtered_coordinates,
-                            energies=[None] * len(filtered_ids),  # placeholder
-                            forces=[None] * len(filtered_ids),  # placeholder
-                            extras={"nms_generation": True},
-                        )
-
-                        save_step_cache(step_dir, step_cache)
-                        logging.info(
-                            f"[step {step_number}] Updated step cache after NMS ({len(filtered_ids)} items)."
-                        )
-                    except Exception as e:
-                        logging.warning(
-                            f"[step {step_number}] Cache write (post-NMS) failed: {e}"
-                        )
-
-            # ---------- Commit this step's results ----------
-            last_coords, last_ids = filtered_coordinates, filtered_ids
-            last_energies, last_forces = energies, forces
-            print(f"Step {step_number} completed: {len(last_coords)} structures ready.")
-
-            # Only write energies if present and aligned
-            if last_energies is not None and len(last_energies) == len(last_ids):
-                self.utils.save_step_csv(
-                    energies=last_energies,
-                    ids=last_ids,
-                    step=step_number,
-                    output_dir=self.output_dir,
-                )
-            else:
-                logging.info(
-                    f"[step {step_number}] Skipping CSV export (energy/ID mismatch or missing energies)."
-                )
-
-            print(f"Your ID's for this step are: {last_ids}")
+            # Commit results to pipeline state + export
+            self._commit_step(ctx, result, state)
+            self._maybe_export_step_csv(ctx, state)
 
         logging.info("ChemRefine pipeline completed.")
+
 
 
 def main():
