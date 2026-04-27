@@ -330,20 +330,35 @@ class OrcaJobSubmitter:
             
             if engine.lower() == "mlff":
                 f.write("# Start MLFF socket server before ORCA\n")
+
                 if model_path:
                     f.write(
-                            f"python -m chemrefine.server --model-path {model_path} --device {device} --bind {bind} "
-                            f"> $OUTPUT_DIR/server.log 2>&1 &\n"
-                            )
+                        f"python -m chemrefine.server --model-path {model_path} --device {device} --bind {bind} > $OUTPUT_DIR/server.log 2>&1 & \n"
+                    )
                 else:
                     f.write(
-                        f"python -m chemrefine.server --model {model_name} --task-name {task_name} --device {device} --bind {bind} "
-                        f"> $OUTPUT_DIR/server.log 2>&1 &\n"
-                        )
+                        f"python -m chemrefine.server --model {model_name} --task-name {task_name} --device {device} --bind {bind} > $OUTPUT_DIR/server.log 2>&1 & \n"
+                    )
 
                 f.write("SERVER_PID=$!\n")
+                f.write("echo Waiting for MLFF server to become ready\n")
+                f.write("for i in {1..120}; do\n")
+                f.write("if curl -s http://127.0.0.1:8888 > /dev/null; then\n")
+                f.write("echo Server is ready!\n")
+                f.write("break\n")
+                f.write("fi\n")
+                f.write("if ! ps -p $SERVER_PID > /dev/null; then\n")
+                f.write("echo Server crashed during startup!\n")
+                f.write("cat $OUTPUT_DIR/server.log\n")
+                f.write("exit 1\n")
+                f.write("fi\n")
+                f.write("sleep 1\n")
+                f.write("done\n")
+                
                 f.write("trap 'kill $SERVER_PID 2>/dev/null' EXIT\n")
-                f.write("sleep 30\n")
+                
+                
+                
                 f.write(
                     f"$ORCA_EXEC {input_file.name} > $OUTPUT_DIR/{job_name}.out || {{ echo 'Error: ORCA execution failed.'; kill $SERVER_PID; exit 1; }}\n"
                 )
