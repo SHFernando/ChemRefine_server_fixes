@@ -341,6 +341,7 @@ class OrcaJobSubmitter:
                     )
 
                 f.write("SERVER_PID=$!\n")
+                f.write("echo Waiting for MLFF server to become ready\n")
                 f.write("for i in {1..120}; do\n")
                 f.write("if curl -s http://127.0.0.1:8888 > /dev/null; then\n")
                 f.write("echo Server is ready!\n")
