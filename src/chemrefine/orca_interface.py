@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 import time
 import numpy as np
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 # chemrefine/orca_interface.py
 
@@ -42,6 +42,8 @@ class OrcaJobSubmitter:
         bind: str = "127.0.0.1:8888",
         scratch_dir: str = None,
         save_scratch: bool = False,
+        basis: Optional[str] = None,
+        functional: Optional[str] = None,
     ):
         """
         Initialize the ORCA job submitter.
@@ -57,38 +59,68 @@ class OrcaJobSubmitter:
         self.utility = Utility()
         self.device = device
         self.bind = bind
-
+        self.basis = basis
+        self.functional = functional
+        
     def submit_files(
-        self,
-        input_files,
-        max_cores=32,
-        template_dir=".",
-        output_dir=".",
-        device=None,
-        operation="OPT+SP",
-        engine="DFT",
-        model_name=None,
-        task_name=None,
-        model_path=None,
-    ):
+    self,
+    input_files,
+    max_cores=32,
+    template_dir=".",
+    output_dir=".",
+    device=None,
+    operation="OPT+SP",
+    engine="dft",
+    model_name=None,
+    task_name=None,
+    model_path=None,
+    *,
+    binds: dict[str, str] | None = None,
+    wait: bool = True,
+):
         """
-        Submits multiple ORCA input files to SLURM, managing PAL values, active job tracking,
-        and ensuring that the total PAL usage does not exceed max_cores.
+        Submit multiple ORCA input files to SLURM.
 
-        Args:
-            input_files (list): List of ORCA input file paths.
-            max_cores (int): Maximum total PAL usage allowed.
-            template_dir (str): Directory containing SLURM header template.
-            output_dir (str): Output directory for SLURM scripts and results.
+        Parameters
+        ----------
+        input_files
+            List of ORCA input file paths.
+        max_cores
+            Maximum total PAL usage allowed for concurrently running jobs.
+        template_dir
+            Directory containing SLURM header template.
+        output_dir
+            Output directory for SLURM scripts and results.
+        device
+            Optional device override. If None, uses self.device.
+        operation, engine, model_name, task_name, model_path
+            Passed through to SLURM script generation.
+        binds
+            Optional mapping of input_file -> bind ("host:port"). If not provided, falls back
+            to self.bind for all scripts.
+        wait
+            If True, block until all submitted jobs are complete (current behavior).
+            If False, submit jobs (respecting max_cores throttling) and return immediately.
+
+        Returns
+        -------
+        dict[str, str]
+            Mapping of input file path -> submitted job id (only for jobs with numeric IDs).
         """
         total_cores_used = 0
-        active_jobs = {}
+        active_jobs: dict[str, int] = {}
+        job_ids_by_input: dict[str, str] = {}
+
+        binds = binds or {}
+        dev = device if device is not None else self.device
 
         for input_file in input_files:
             input_path = Path(input_file).resolve()
             pal_value = self.parse_pal_from_input(input_path)
             pal_value = min(pal_value, max_cores)
             logging.info(f"Setting PAL value to {pal_value} for {input_path.name}")
+            # pick bind for this exact input file (keyed by resolved path)
+            bind_i = binds.get(str(input_path), self.bind)
 
             # Wait if not enough free cores
             while total_cores_used + pal_value > max_cores:
@@ -105,31 +137,40 @@ class OrcaJobSubmitter:
 
                 time.sleep(10)
 
+            # ---- PER-INPUT BIND HERE ----
+            bind_i = binds.get(str(input_path), binds.get(input_path.name, self.bind))
+
             slurm_script = self.generate_slurm_script(
                 input_file=input_path,
                 pal_value=pal_value,
                 template_dir=template_dir,
                 output_dir=output_dir,
-                device=self.device,
+                device=dev,
                 model_name=model_name,
                 task_name=task_name,
                 operation=operation,
                 engine=engine,
-                bind=self.bind,
+                bind=bind_i,                 # <-- use per-input bind
                 model_path=model_path,
+                basis=self.basis,
+                functional=self.functional,
             )
 
             job_id = self.utility.submit_job(slurm_script)
             time.sleep(3)
-            logging.info(
-                f"Submitted ORCA job with ID: {job_id} for input: {input_path.name}"
-            )
+            logging.info(f"Submitted ORCA job with ID: {job_id} for input: {input_path.name}")
 
-            if job_id.isdigit():
+            if isinstance(job_id, str) and job_id.isdigit():
                 active_jobs[job_id] = pal_value
                 total_cores_used += pal_value
+                job_ids_by_input[str(input_path)] = job_id
             else:
                 logging.warning(f"Skipping job tracking for invalid job ID '{job_id}'")
+
+        # ---- IMPORTANT CHANGE: only wait if requested ----
+        if not wait:
+            logging.info("All jobs submitted (non-blocking mode).")
+            return job_ids_by_input
 
         logging.info("All jobs submitted. Waiting for remaining jobs to complete...")
         while active_jobs:
@@ -146,6 +187,7 @@ class OrcaJobSubmitter:
             time.sleep(30)
 
         logging.info("All calculations finished.")
+        return job_ids_by_input
 
     def parse_pal_from_input(self, input_file: Path):
         """
@@ -166,20 +208,27 @@ class OrcaJobSubmitter:
         return 1
 
     def generate_slurm_script(
-        self,
-        input_file: Path,
-        pal_value: int,
-        template_dir: str,
-        output_dir: str = ".",
-        job_name: str = None,
-        device: str = "cpu",
-        operation: str = "OPT+SP",
-        engine: str = "DFT",
-        model_name: str = "uma-s-1",
-        task_name: str = "omol",
-        bind: str = "127.0.0.1:8888",
-        model_path: str = None,
-    ):
+    self,
+    input_file: Path,
+    pal_value: int,
+    template_dir: str,
+    output_dir: str = ".",
+    job_name: str = None,
+    device: str = "cpu",
+    operation: str = "OPT+SP",
+    engine: str = "DFT",
+    model_name: str = "uma-s-1",
+    task_name: str = "omol",
+    bind: str = "127.0.0.1:8888",
+    model_path: str = None,
+    # --- NEW: PySCF knobs ---
+    basis: str | None = None,
+    functional: str | None = None,   # or xc
+    df: bool = False,
+    gpu: bool | None = None,
+    pyscf_method: str = "dft",
+):
+
         """
         Generate a SLURM script by combining a user-provided header with a consistent footer.
 
@@ -278,9 +327,10 @@ class OrcaJobSubmitter:
             f.write(
                 "cd $SCRATCH_DIR || { echo 'Error: Failed to change directory'; exit 1; }\n\n"
             )
-
+            
             if engine.lower() == "mlff":
                 f.write("# Start MLFF socket server before ORCA\n")
+
                 if model_path:
                     f.write(
                         f"python -m chemrefine.server --model-path {model_path} --device {device} --bind {bind} > $OUTPUT_DIR/server.log 2>&1 & \n"
@@ -291,30 +341,67 @@ class OrcaJobSubmitter:
                     )
 
                 f.write("SERVER_PID=$!\n")
-                f.write("for i in {1..120}; do\n")
-                f.write("if curl -s http://127.0.0.1:8888 > /dev/null; then\n")
-                f.write("echo Server is ready!\n")
-                f.write("break\n")
-                f.write("fi\n")
+                f.write(f"serverIP={bind}\n")
+                f.write("echo Waiting for MLFF server to become ready\n")
+                f.write("for i in {1..24}; do\n")
                 f.write("if ! ps -p $SERVER_PID > /dev/null; then\n")
                 f.write("echo Server crashed during startup!\n")
                 f.write("cat $OUTPUT_DIR/server.log\n")
                 f.write("exit 1\n")
                 f.write("fi\n")
-                f.write("sleep 1\n")
+                f.write("if nc -z ${serverIP:0:9} ${serverIP:10} 2>/dev/null; then\n")
+                f.write(f"echo Server {bind} is ready!\n")
+                f.write("break\n")
+                f.write("else\n")
+                f.write("echo waiting 5s\n")
+                f.write("sleep 5\n")
+                f.write("fi\n")
+                f.write("if (($i==24)); then\n")
+                f.write("echo server is not listening after 120s !exiting!\n")
+                f.write("exit 1\n")
+                f.write("fi\n")
                 f.write("done\n")
                 
                 f.write("trap 'kill $SERVER_PID 2>/dev/null' EXIT\n")
                 
+                
+                
                 f.write(
                     f"$ORCA_EXEC {input_file.name} > $OUTPUT_DIR/{job_name}.out || {{ echo 'Error: ORCA execution failed.'; kill $SERVER_PID; exit 1; }}\n"
                 )
+            
+            elif engine.lower() == "pyscf":
+                f.write("# Start PySCF server before ORCA (external backend)\n")
+                f.write(f"echo 'JOB {job_name} using bind {bind}'\n")
+                # Choose python executable (optional). If not set, rely on env/modules.
+                
+
+                # Start server in background
+                f.write(
+                    f"python -m chemrefine.pyscf_server "
+                    f"--bind {bind} --nthreads 4 "
+                    f"--log-file $OUTPUT_DIR/pyscf_server.log "
+                    f"> $OUTPUT_DIR/pyscf_server.stdout 2>&1 &\n"
+                )
+                f.write("SERVER_PID=$!\n")
+                f.write("trap 'kill $SERVER_PID 2>/dev/null' EXIT\n")
+                f.write("sleep 5\n")  # usually enough if it starts fast
+
+                f.write("export OMP_NUM_THREADS=1\n")
+                f.write(
+                    f"$ORCA_EXEC {input_file.name} > $OUTPUT_DIR/{job_name}.out "
+                    "|| { echo 'Error: ORCA execution failed.'; kill $SERVER_PID; exit 1; }\n"
+                )
                 f.write("kill $SERVER_PID\n\n")
+
+
+
             else:
                 f.write("export OMP_NUM_THREADS=1\n")
                 f.write(
                     f"$ORCA_EXEC {input_file.name} > $OUTPUT_DIR/{job_name}.out || {{ echo 'Error: ORCA execution failed.'; exit 1; }}\n\n"
                 )
+                f.write("kill $SERVER_PID\n\n")
 
             # File copy commands
             f.write("cp *.out *.xyz *.xyz $OUTPUT_DIR \n")
@@ -336,41 +423,46 @@ class OrcaInterface:
         self.job_submitter = OrcaJobSubmitter()
 
     def create_input(
-        self,
-        xyz_files,
-        template,
-        charge,
-        multiplicity,
-        output_dir="./",
-        operation="OPT+SP",
-        engine="DFT",
-        model_name=None,
-        task_name=None,
-        device="cuda",
-        bind="127.0.0.1:8888",
-    ):
+    self,
+    xyz_files,
+    template,
+    charge,
+    multiplicity,
+    output_dir="./",
+    operation="OPT+SP",
+    engine="dft",
+    model_name=None,
+    task_name=None,
+    device="cuda",
+    bind="127.0.0.1:8888",
+    # --- NEW: PySCF knobs ---
+    pyscf_prog: str | None = None,   # path to pyscf.sh (defaults to chemrefine/pyscf.sh)
+    pyscf_method: str = "dft",       # what your server expects; keep "dft" if that's your API
+    xc: str | None = None,           # e.g., "pbe"
+    basis: str | None = None,        # e.g., "def2-svp"
+    df: bool = False,                # adds --df
+    gpu: bool | None = None,         # adds --gpu; if None, infer from device=="cuda"
+):
         """
-        Generate ORCA .inp files from xyz inputs, adding MLFF external method if specified.
+        Generate ORCA .inp files from xyz inputs, adding external method blocks if specified.
 
-        Args:
-            xyz_files (list): List of xyz file paths.
-            template (str): ORCA input template path.
-            charge (int): Molecular charge.
-            multiplicity (int): Spin multiplicity.
-            output_dir (str): Destination directory.
-            operation (str): Operation type (e.g., 'GOAT', 'OPT+SP').
-            engine (str): Computational engine ('dft' or 'mlff').
-            model_name (str): MLFF model name (if using MLFF).
-            task_name (str): MLFF task name (if using MLFF).
-            device (str): Device for MLFF ('cuda' or 'cpu').
-            bind (str): Server bind address for MLFF.
-
-        Returns:
-            tuple: Lists of input and output file paths.
+        Supported engines:
+        - dft: standard ORCA input
+        - mlff: ORCA external method (uma.sh)
+        - pyscf: ORCA external method (pyscf.sh) for energies/gradients while ORCA drives OPT
         """
+        import re
+        import os
+        import logging
+
         input_files, output_files = [], []
-        logging.debug(f"output_dir IN create_input: {output_dir}")
         os.makedirs(output_dir, exist_ok=True)
+
+        eng = (engine or "dft").lower()
+
+        # infer gpu flag if not explicitly provided
+        if gpu is None:
+            gpu = (device or "").lower() == "cuda"
 
         for xyz in xyz_files:
             base = os.path.splitext(os.path.basename(xyz))[0]
@@ -385,17 +477,58 @@ class OrcaInterface:
             # Remove any old xyzfile lines and clean formatting
             content = re.sub(r"^\s*\*\s+xyzfile.*$", "", content, flags=re.MULTILINE)
             content = content.rstrip() + "\n\n"
-            if engine and engine.lower() == "mlff":
-                # Add MLFF method block if specified
-                run_mlff_path = os.path.abspath(
-                    os.path.join(os.path.dirname(__file__), "uma.sh")
-                )
-                ext_params = f"--bind {bind}"
+
+            # -------------------------
+            # External engines
+            # -------------------------
+            if eng == "mlff":
+                run_mlff_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "uma.sh"))
+
+                # include bind (+ optionally device/model/task if your uma.sh supports them)
+                ext_parts = [f"--bind {bind}"]
+                # ext_parts.append(f"--device {device}")     # uncomment if supported
+                # if model_name: ext_parts.append(f"--model {model_name}")
+                # if task_name:  ext_parts.append(f"--task {task_name}")
+
+                ext_params = " ".join(ext_parts)
+
                 content += "%method\n"
                 content += f'  ProgExt "{run_mlff_path}"\n'
                 content += f'  Ext_Params "{ext_params}"\n'
                 content += "end\n\n"
 
+            elif eng == "pyscf":
+                # default path if not provided
+                if pyscf_prog is None:
+                    pyscf_prog = os.path.abspath(os.path.join(os.path.dirname(__file__), "pyscf.sh"))
+
+                # require xc and basis for pyscf
+                if not xc:
+                    raise ValueError("engine='pyscf' requires xc (e.g., 'pbe').")
+                if not basis:
+                    raise ValueError("engine='pyscf' requires basis (e.g., 'def2-svp').")
+
+                ext_parts = [
+                    f"--bind {bind}",
+                    f"--method {pyscf_method}",
+                    f"--xc {xc}",
+                    f"--basis {basis}",
+                ]
+                if df:
+                    ext_parts.append("--df")
+                if gpu:
+                    ext_parts.append("--gpu")
+
+                ext_params = " ".join(ext_parts)
+
+                content += "%method\n"
+                content += f'  ProgExt "{pyscf_prog}"\n'
+                content += f'  Ext_Params "{ext_params}"\n'
+                content += "end\n\n"
+
+            # -------------------------
+            # XYZ file line
+            # -------------------------
             content += f'%base "{base}_opt" \n'
             content += f"* xyzfile {charge} {multiplicity} {xyz}\n\n"
 
@@ -403,6 +536,7 @@ class OrcaInterface:
                 f.write(content)
 
         return input_files, output_files
+
 
     def parse_output(self, file_paths, operation, dir: str = "./"):
         """
@@ -474,16 +608,6 @@ class OrcaInterface:
                     coords, ens = self.parse_docker_xyz(docker_xyz_file)
                     if not ens or None in ens:
                         raise ValueError("No valid energies in Docker output.")
-
-                    # Exclude the last structure (non-sensible)
-                    if len(coords) > 1:
-                        coords = coords[:-1]
-                        ens = ens[:-1]
-                    else:
-                        raise ValueError(
-                            "Docker output only has one structure — cannot skip last."
-                        )
-
                     coordinates.extend(coords)
                     energies.extend(ens)
                     forces.extend([None] * len(coords))
